@@ -1,1 +1,6 @@
 .DS_Store
+# Phase 2 compiled binaries
+phase2/client
+phase2/server
+phase2/mitm_proxy
+phase2/tamper_proxy
