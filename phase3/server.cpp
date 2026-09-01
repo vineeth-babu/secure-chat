@@ -21,6 +21,7 @@
 #include "dh.h"
 #include "crypto.h"
 #include "net.h"
+#include "certs.h"
 
 #include <openssl/crypto.h>
 
@@ -109,12 +110,22 @@ static void log_recv_failure(const std::string &who, crypto::RecvResult r)
 /* one client                                                          */
 /* ------------------------------------------------------------------ */
 
-static void handle_client(int fd, std::string peer)
+static void handle_client(int fd, std::string peer,
+                          X509 *srv_cert, EVP_PKEY *srv_key)
 {
     /* The Session owns the fd from here on; its destructor closes it on
        every exit path below. */
     SessionPtr sess = std::make_shared<Session>();
     sess->fd = fd;
+
+    /* ---------- Phase 3: prove our identity BEFORE any DH ---------- */
+
+    std::string auth_why;
+    if (!certs::server_send_auth(fd, srv_cert, srv_key, &auth_why)) {
+        std::cout << "[AUTH-FAIL] " << peer << ": " << auth_why << "\n";
+        std::cout.flush();
+        return;     /* Session dtor closes fd */
+    }
 
     /* ---------- 1. independent DH exchange for THIS connection ---------- */
 
@@ -305,12 +316,42 @@ static void handle_client(int fd, std::string peer)
 /* main                                                                */
 /* ------------------------------------------------------------------ */
 
-int main()
+int main(int argc, char *argv[])
 {
+    /* Phase 3: load the server certificate and its private key once, at
+       startup. Defaults to ./server-cert.pem and ./server-key.pem; override
+       as argv[1] and argv[2]. */
+    const char *cert_path = (argc > 1) ? argv[1] : "server-cert.pem";
+    const char *key_path  = (argc > 2) ? argv[2] : "server-key.pem";
+
+    std::string cert_why;
+    X509 *cert = certs::load_cert_file(cert_path, &cert_why);
+    if (cert == nullptr) {
+        std::cerr << "Cannot load server certificate: " << cert_why << "\n";
+        return 1;
+    }
+
+    EVP_PKEY *key = certs::load_privkey_file(key_path, &cert_why);
+    if (key == nullptr) {
+        std::cerr << "Cannot load server private key: " << cert_why << "\n";
+        X509_free(cert);
+        return 1;
+    }
+
+    /* Fail fast if the operator paired a mismatched cert and key. */
+    if (!certs::key_matches_cert(cert, key, &cert_why)) {
+        std::cerr << "Configuration error: " << cert_why << "\n";
+        EVP_PKEY_free(key);
+        X509_free(cert);
+        return 1;
+    }
+
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
 
     if (server_fd < 0) {
         std::cerr << "Socket creation failed\n";
+        EVP_PKEY_free(key);
+        X509_free(cert);
         return 1;
     }
 
@@ -336,9 +377,9 @@ int main()
         return 1;
     }
 
-    std::cout << "Phase 2 server listening on port " << PORT << "\n"
-              << "Each client performs its own Diffie-Hellman exchange "
-                 "(RFC 3526 group 14).\n";
+    std::cout << "Phase 3 server listening on port " << PORT << "\n"
+              << "Sends its certificate and proves key possession before each "
+                 "client's Diffie-Hellman exchange (RFC 3526 group 14).\n";
     std::cout.flush();
 
     while (true) {
@@ -355,7 +396,7 @@ int main()
         }
 
         std::thread(handle_client, client_fd,
-                    peer_string(client_addr)).detach();
+                    peer_string(client_addr), cert, key).detach();
     }
 
     close(server_fd);

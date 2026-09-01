@@ -5,3 +5,15 @@ phase2/server
 phase2/mitm_proxy
 phase2/tamper_proxy
 phase2/dh_test
+
+# Phase 3 compiled binaries
+phase3/client
+phase3/server
+phase3/mitm_proxy_p3
+
+# Phase 3 generated PKI material
+phase3/ca-cert.pem
+phase3/ca-cert.srl
+phase3/ca-key.pem
+phase3/server-cert.pem
+phase3/server-key.pem

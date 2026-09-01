@@ -8,12 +8,20 @@
  *     /quit               disconnect cleanly and exit
  *     anything else       sent as a plain chat message to the selected user
  *
- * Usage: ./client [server-ip] [port]
+ * Usage: ./client [connect-ip] [port] [ca-cert] [expected-server-ip]
+ *   connect-ip           TCP destination (default 192.168.64.2)
+ *   port                 TCP port (default 5000)
+ *   ca-cert              trusted CA root PEM (default ca-cert.pem)
+ *   expected-server-ip   identity to authenticate in the cert's IP SAN;
+ *                        defaults to connect-ip. Set this separately only when
+ *                        connecting through a proxy, to authenticate the REAL
+ *                        server rather than the proxy's address.
  */
 
 #include "dh.h"
 #include "crypto.h"
 #include "net.h"
+#include "certs.h"
 
 #include <openssl/crypto.h>
 
@@ -23,6 +31,7 @@
 
 #include <atomic>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <string>
 #include <thread>
@@ -102,6 +111,16 @@ int main(int argc, char *argv[])
 {
     const char *server_ip = (argc > 1) ? argv[1] : DEFAULT_SERVER_IP;
     const int   port      = (argc > 2) ? std::atoi(argv[2]) : DEFAULT_PORT;
+    /* Phase 3: trusted CA root. Defaults to ./ca-cert.pem; override as argv[3].
+       This is loaded from local disk and never from the network. */
+    const char *ca_path   = (argc > 3) ? argv[3] : "ca-cert.pem";
+    /* Phase 3: the server identity the client authenticates (the IP that must
+       appear in the certificate's IP SAN). This is DELIBERATELY separate from
+       the TCP destination: normally they are the same, but when connecting
+       through a proxy the client still authenticates the REAL server's
+       identity, not the proxy's address. Defaults to the connect IP, so
+       ordinary usage is unchanged; override as argv[4] for proxy testing. */
+    const char *expected_ip = (argc > 4) ? argv[4] : server_ip;
 
     std::string username;
     std::cout << "Enter username: ";
@@ -138,6 +157,41 @@ int main(int argc, char *argv[])
     }
 
     std::cout << "Connected to " << server_ip << ":" << port << "\n";
+    if (std::strcmp(expected_ip, server_ip) != 0) {
+        std::cout << "Authenticating server identity " << expected_ip
+                  << " (TCP destination " << server_ip
+                  << " is a different host -- e.g. a proxy).\n";
+    }
+
+    /* ---------- Phase 3: authenticate the server BEFORE any DH ---------- */
+
+    std::string auth_why;
+
+    X509_STORE *ca_store = certs::load_ca_store(ca_path, &auth_why);
+    if (ca_store == nullptr) {
+        std::cerr << "Cannot load trusted CA (" << ca_path << "): "
+                  << auth_why << "\n";
+        close(client_fd);
+        return 1;
+    }
+
+    std::cout << "Validating server certificate and proof-of-possession...\n";
+    std::cout.flush();
+
+    if (!certs::client_verify_auth(client_fd, ca_store, expected_ip, &auth_why)) {
+        /* §4.1: on ANY validation failure the client aborts immediately and
+           does not proceed to DH or reveal a username. */
+        std::cerr << "[AUTH] server authentication FAILED: " << auth_why
+                  << "\n[AUTH] Aborting before DH. No data was sent.\n";
+        X509_STORE_free(ca_store);
+        close(client_fd);
+        return 1;
+    }
+
+    X509_STORE_free(ca_store);
+    std::cout << "[AUTH] Server certificate valid and private-key possession "
+                 "proven.\n";
+    std::cout.flush();
 
     /* ---------- Diffie-Hellman ---------- */
 

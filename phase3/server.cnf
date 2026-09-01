@@ -1,0 +1,19 @@
+[req]
+distinguished_name = dn
+prompt             = no
+
+[dn]
+C  = IN
+O  = CS6008
+CN = chat-server
+
+[v3_server]
+basicConstraints       = critical,CA:FALSE
+keyUsage               = critical,digitalSignature,keyEncipherment
+extendedKeyUsage       = serverAuth
+subjectAltName         = @alt_names
+subjectKeyIdentifier   = hash
+authorityKeyIdentifier = keyid,issuer
+
+[alt_names]
+IP.1 = 192.168.64.2
