@@ -17,3 +17,19 @@ phase3/ca-cert.srl
 phase3/ca-key.pem
 phase3/server-cert.pem
 phase3/server-key.pem
+
+# Phase 4 compiled binaries
+phase4/client
+phase4/server
+phase4/dh_test
+phase4/e2e_test
+phase4/mitm_proxy
+phase4/mitm_proxy_p3
+phase4/tamper_proxy
+
+# Phase 4 generated PKI material
+phase4/ca-cert.pem
+phase4/ca-cert.srl
+phase4/ca-key.pem
+phase4/server-cert.pem
+phase4/server-key.pem
