@@ -1,56 +1,6 @@
 /*
- * mitm_proxy_p3.cpp -- CS6008 Phase 3 §4.2: the Phase 2 MITM, re-run and defeated
- *
- * This is a genuine update of the Phase 2 two-socket MITM
- * (mitm_proxy.cpp), NOT a local fake server. It keeps the same architecture:
- *
- *     Victim client  <-->  Mallory (this process)  <-->  Real server
- *
- * Mallory listens for the victim AND opens a real TCP connection to the
- * genuine Phase 3 server, exactly as in Phase 2. The only thing added is the
- * Phase 3 authentication step the victim now performs first -- and that step
- * is what defeats the attack, in one of two clearly distinct ways:
- *
- *   mode "fake"    Mallory presents a self-signed certificate it made itself.
- *                 The victim's CA check rejects it (does not chain to the
- *                 trusted CA). The victim aborts BEFORE sending its challenge,
- *                 so Mallory never reaches DH and never sees plaintext.
- *
- *   mode "copied" Mallory presents a byte-for-byte copy of the REAL server
- *                 certificate (public, trivially copyable) but does NOT have
- *                 the server's private key. The victim's CA + identity checks
- *                 PASS, so the victim sends a fresh challenge. Mallory cannot
- *                 sign that challenge (no private key), so it sends a bogus
- *                 signature; the victim's proof-of-possession check fails and
- *                 it aborts before DH.
- *
- * In BOTH modes the victim never begins DH with Mallory, so the Phase 2
- * plaintext-relay stage is never reached -- the exact opposite of Phase 2.
- *
- * HONEST LIMITATION (documented for the report). The server signs only the
- * client's challenge; the signature is not bound to the DH public values.
- * Therefore a copied-cert Mallory that *forwards the victim's challenge to the
- * real server* and relays the real signature back WOULD pass proof-of-
- * possession, and could then run the Phase 2 two-DH attack. This driver
- * deliberately demonstrates the non-forwarding attempt (Mallory acting as the
- * server itself), which fails, and prints a note pointing at challenge->DH
- * binding as the fix. That binding is the natural Phase 3 hardening / Phase 4
- * groundwork. We do NOT weaken validation or PoP to make the attack "work".
- *
- * Reuses the project's own dh.*, crypto.*, net.*, certs.* -- no TLS/SSL, no
- * DH/ECDH exchange API.
- *
- * Build:  make mitm_proxy_p3
- * Usage:
- *   ./mitm_proxy_p3 <listen_port> <server_ip> <server_port> \
- *                   <fake|copied> <cert.pem> [key.pem]
- *
- *   fake:    cert.pem = a self-signed cert Mallory generated (rogue-cert.pem).
- *            key.pem may be given but is irrelevant; validation fails first.
- *   copied:  cert.pem = a copy of the real server-cert.pem. No key.pem, since
- *            the whole point is that Mallory lacks the matching private key.
- *
- * Run Mallory on the Mallory VM; point the victim at Mallory:
+ * mitm_proxy_p3.cpp -- the same MITM, now defeated by cert-based auth
+ * Run Mallory on its own VM, point the victim at it:
  *   ./client <mallory-ip> <listen_port> ca-cert.pem
  */
 
@@ -78,9 +28,7 @@
 #include <thread>
 #include <vector>
 
-/* ------------------------------------------------------------------ */
-/* length-framed helpers (same wire convention as certs.cpp)           */
-/* ------------------------------------------------------------------ */
+// length-framed helpers, same wire convention as certs.cpp
 
 static bool send_framed(int fd, const unsigned char *buf, size_t len)
 {
@@ -102,9 +50,7 @@ static bool recv_framed(int fd, std::vector<unsigned char> &out, size_t cap)
     return net::read_exact(fd, out.data(), len);
 }
 
-/* ------------------------------------------------------------------ */
-/* connect to the real server (identical to Phase 2 MITM)              */
-/* ------------------------------------------------------------------ */
+// connect to the real server, same as the earlier MITM
 
 static int connect_to_server(const char *server_ip, int server_port)
 {
@@ -131,15 +77,13 @@ static int connect_to_server(const char *server_ip, int server_port)
     return server_fd;
 }
 
-/* ------------------------------------------------------------------ */
-/* one intercepted session                                             */
-/* ------------------------------------------------------------------ */
+// one intercepted session
 
 static void handle_victim(int victim_fd, const char *server_ip,
                           int server_port, const std::string &mode,
                           X509 *cert, EVP_PKEY *key)
 {
-    /* ---- genuine two-socket MITM: open a real link to the server ---- */
+    // genuine two-socket MITM: open a real link to the server
     int server_fd = connect_to_server(server_ip, server_port);
     if (server_fd < 0) {
         std::printf("[mitm-p3] could not reach the real server; aborting "
@@ -154,11 +98,11 @@ static void handle_victim(int victim_fd, const char *server_ip,
                 server_ip, server_port);
 
     /*
-     * The real server speaks first in Phase 3: it sends its certificate, then
-     * reads a challenge, then signs it. To stay a faithful Phase 2-style MITM
-     * we must consume the server's certificate frame from the server link so
-     * the two sockets don't desynchronise. We read it and discard it: Mallory
-     * cannot use the real cert as its own without the matching key anyway.
+     * The real server speaks first: it sends its cert, reads a challenge,
+     * then signs it. To keep the two sockets from desyncing we still have
+     * to consume that certificate frame on the server link -- we just read
+     * it and throw it away, since Mallory can't use the real cert without
+     * the matching key anyway.
      */
     std::vector<unsigned char> real_cert_der;
     if (!recv_framed(server_fd, real_cert_der, certs::MAX_CERT_BYTES)) {
@@ -172,7 +116,7 @@ static void handle_victim(int victim_fd, const char *server_ip,
                 "server link (%zu bytes).\n", real_cert_der.size());
     std::fflush(stdout);
 
-    /* ---- present OUR certificate to the victim (fake or copied) ---- */
+    // present our certificate to the victim (fake or copied)
     unsigned char *der = nullptr;
     int derlen = i2d_X509(cert, &der);
     if (derlen <= 0 || !send_framed(victim_fd, der, static_cast<size_t>(derlen))) {
@@ -187,11 +131,11 @@ static void handle_victim(int victim_fd, const char *server_ip,
                 mode.c_str());
     std::fflush(stdout);
 
-    /* ---- try to read the victim's challenge ---- */
+    // try to read the victim's challenge
     std::vector<unsigned char> challenge;
     if (!recv_framed(victim_fd, challenge, certs::CHALLENGE_BYTES + 16)) {
-        /* fake mode lands here: the victim rejected the cert at validation
-           and closed without ever sending a challenge. */
+        // fake mode lands here: the victim rejected the cert at validation
+        // and closed without sending a challenge
         std::printf("\n[mitm-p3] === DEFEATED at CERTIFICATE VALIDATION ===\n");
         std::printf("[mitm-p3] The victim rejected our certificate (it does "
                     "not chain to the trusted CA) and sent NO challenge.\n");
@@ -203,19 +147,19 @@ static void handle_victim(int victim_fd, const char *server_ip,
         return;
     }
 
-    /* copied mode reaches here: the victim accepted the (genuine) certificate
-       and sent a fresh challenge. */
+    // copied mode reaches here: the victim accepted the genuine
+    // certificate and sent a fresh challenge
     std::printf("[mitm-p3] the victim ACCEPTED the certificate and sent a "
                 "%zu-byte challenge.\n", challenge.size());
     std::printf("[mitm-p3] attempting to prove possession of the private "
                 "key we do NOT have...\n");
     std::fflush(stdout);
 
-    /* Try to sign. In copied mode we hold no key (key == nullptr), so we
-       cannot produce a valid signature; send a bogus one so the victim's
-       verify step visibly runs and fails rather than hanging. If a (wrong)
-       key was supplied, sign with it -- the victim's check against the
-       certificate's real public key will still fail. */
+    // try to sign. In copied mode we have no key (key == nullptr) so we
+    // can't produce a valid signature -- send a bogus one so the victim's
+    // verify step visibly runs and fails instead of just hanging. If some
+    // other key was supplied, sign with it anyway; the victim's check
+    // against the cert's real public key will still fail.
     std::vector<unsigned char> sig;
     bool signed_ok = false;
 
@@ -265,9 +209,7 @@ static void handle_victim(int victim_fd, const char *server_ip,
     close(server_fd);
 }
 
-/* ------------------------------------------------------------------ */
-/* main                                                                */
-/* ------------------------------------------------------------------ */
+// main
 
 int main(int argc, char *argv[])
 {
@@ -302,8 +244,8 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    /* Mallory only has a private key in the 'fake' case (its own self-signed
-       pair). In 'copied' mode it deliberately has none -- that is the point. */
+    // Mallory only has a private key in the 'fake' case (its own
+    // self-signed pair). In 'copied' mode it deliberately has none.
     EVP_PKEY *key = nullptr;
     if (key_path != nullptr) {
         key = certs::load_privkey_file(key_path, &why);

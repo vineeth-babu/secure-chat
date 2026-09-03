@@ -1,5 +1,5 @@
 /*
- * net.cpp -- CS6008 Phase 2
+ * net.cpp
  */
 
 #include "net.h"

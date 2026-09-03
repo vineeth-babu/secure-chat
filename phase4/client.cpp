@@ -1,21 +1,11 @@
 /*
- * client.cpp -- CS6008 Phase 2: chat client with DH + AES-256-GCM
- *
- * Command interface (assignment §1.3):
- *     @username message   send to username, and select username
- *     /chat username      select username without sending
- *     /who                list online users
- *     /quit               disconnect cleanly and exit
- *     anything else       sent as a plain chat message to the selected user
- *
- * Usage: ./client [connect-ip] [port] [ca-cert] [expected-server-ip]
- *   connect-ip           TCP destination (default 192.168.64.2)
- *   port                 TCP port (default 5000)
- *   ca-cert              trusted CA root PEM (default ca-cert.pem)
- *   expected-server-ip   identity to authenticate in the cert's IP SAN;
- *                        defaults to connect-ip. Set this separately only when
- *                        connecting through a proxy, to authenticate the REAL
- *                        server rather than the proxy's address.
+ * Chat client implementation with end-to-end encryption.
+ * Supports basic commands:
+ *   @username <msg> - send to user and select them
+ *   /chat <user>    - select active user
+ *   /e2e <user>     - start key exchange
+ *   /who            - list active users
+ *   /quit           - disconnect
  */
 
 #include "dh.h"
@@ -40,32 +30,8 @@
 static const char *DEFAULT_SERVER_IP = "192.168.64.2";
 static const int   DEFAULT_PORT      = 5000;
 
-/* ------------------------------------------------------------------ */
-/* receiver thread                                                     */
-/* ------------------------------------------------------------------ */
-
-/*
- * Wrap one outgoing chat message for `recipient`.
- *
- * If a usable E2E session exists, the plaintext is sealed under the E2E key
- * and tagged __E2E_MSG__ BEFORE being handed to the existing outer
- * SecureChannel -- an additional inner layer, never a replacement. Otherwise
- * the Phase 3 plaintext behaviour is unchanged.
- *
- * Both outgoing paths (@user and the selected-partner fallback) go through
- * this one function so the E2E decision cannot diverge between them.
- */
-/*
- * RETURN CONTRACT: the bool means "the connection is still usable", NOT
- * "the message was sent". The caller uses it solely to decide whether to
- * abort the chat loop, so a purely local failure (e.g. an oversized E2E
- * payload) reports the error to the user and returns true -- the session is
- * fine, only this one message was dropped. Only a transport failure on the
- * outer SecureChannel returns false.
- *
- * CRITICAL: once an E2E session exists there is NO plaintext fallback. If
- * sealing fails the message is dropped, never sent in the clear.
- */
+// Helper to encrypt and send if an E2E session is active, otherwise send standard message.
+// Returns false only if the underlying socket fails.
 static bool send_chat(int fd, crypto::SecureChannel *ch,
                       e2e::E2EManager *mgr,
                       const std::string &recipient,
@@ -73,6 +39,7 @@ static bool send_chat(int fd, crypto::SecureChannel *ch,
 {
     unsigned char key[e2e::KEY_BYTES];
 
+    // Check if we already have an active session with this recipient
     if (mgr->get_key(recipient, key)) {
         std::string blob;
         bool sealed = e2e::seal(key, text, blob);
@@ -81,7 +48,7 @@ static bool send_chat(int fd, crypto::SecureChannel *ch,
         if (!sealed) {
             std::cout << "[E2E] Message too long for an E2E payload (max "
                       << e2e::MAX_E2E_PLAINTEXT << " bytes). Not sent.\n";
-            /* Dropped, never downgraded to plaintext. Connection is fine. */
+            // Drop message rather than falling back to plaintext; connection is still valid
             return true;
         }
 
@@ -89,10 +56,11 @@ static bool send_chat(int fd, crypto::SecureChannel *ch,
                                 std::string(e2e::TAG_MSG) + blob);
     }
 
-    /* No E2E session: unchanged Phase 3 behaviour. */
+    // Default: send regular message over outer secure channel
     return ch->send_msg(fd, "MSG|" + recipient + "|" + text);
 }
 
+// Background thread to handle incoming network traffic
 static void receive_messages(int socket_fd,
                              crypto::SecureChannel *ch,
                              e2e::E2EManager *mgr,
@@ -128,12 +96,12 @@ static void receive_messages(int socket_fd,
             }
 
             running->store(false);
-            /* Unblock the main thread, which is sitting in getline(). */
+            // Unblock main thread from getline()
             shutdown(socket_fd, SHUT_RDWR);
             break;
         }
 
-        /* Incoming chat message */
+        // Handle incoming chat messages
         if (line.rfind("FROM|", 0) == 0) {
 
             size_t separator = line.find('|', 5);
@@ -142,20 +110,12 @@ static void receive_messages(int socket_fd,
                 std::string sender  = line.substr(5, separator - 5);
                 std::string message = line.substr(separator + 1);
 
-                /* ---------- Phase 4: E2E control and data ----------
-                   These are consumed here and MUST NOT fall through to
-                   ordinary chat display (assignment §1.4). */
-
+                // Check for E2E control or encrypted data
                 if (message.rfind(e2e::TAG_INIT, 0) == 0) {
                     std::string ack;
                     e2e::Result r = mgr->handle_init(sender, message, ack);
 
                     if (r == e2e::Result::Ok) {
-                        /* Only report establishment if the ACK actually went
-                           out. If the send fails the outer connection is
-                           already broken and the session is ending, but we
-                           must not print a misleading "established" line the
-                           peer can never have seen. */
                         if (ch->send_msg(socket_fd,
                                          "MSG|" + sender + "|" + ack)) {
                             std::cout << "\n[E2E] Session with " << sender
@@ -168,8 +128,7 @@ static void receive_messages(int socket_fd,
                                       << " (connection problem).\n> ";
                         }
                     } else if (r == e2e::Result::GlareIgnored) {
-                        /* Simultaneous /e2e: we won the tie-break, so we keep
-                           our own handshake and send no ACK. */
+                        // Handled simultaneous handshake; tie-breaker won
                         std::cout << "\n[E2E] Simultaneous setup with "
                                   << sender << "; keeping our handshake "
                                      "(tie-break winner).\n> ";
@@ -214,7 +173,6 @@ static void receive_messages(int socket_fd,
                     OPENSSL_cleanse(key, sizeof(key));
 
                     if (!ok) {
-                        /* Never show ciphertext, never show partial data. */
                         std::cout << "\n[E2E] AES-GCM authentication FAILED "
                                      "on a message from " << sender
                                   << ". Message discarded.\n> ";
@@ -227,7 +185,7 @@ static void receive_messages(int socket_fd,
                     continue;
                 }
 
-                /* ---------- ordinary Phase 3 chat ---------- */
+                // Standard message display
                 std::cout << "\n" << sender << ": " << message << "\n> ";
                 std::cout.flush();
             }
@@ -240,23 +198,12 @@ static void receive_messages(int socket_fd,
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* main                                                                */
-/* ------------------------------------------------------------------ */
-
 int main(int argc, char *argv[])
 {
     const char *server_ip = (argc > 1) ? argv[1] : DEFAULT_SERVER_IP;
     const int   port      = (argc > 2) ? std::atoi(argv[2]) : DEFAULT_PORT;
-    /* Phase 3: trusted CA root. Defaults to ./ca-cert.pem; override as argv[3].
-       This is loaded from local disk and never from the network. */
     const char *ca_path   = (argc > 3) ? argv[3] : "ca-cert.pem";
-    /* Phase 3: the server identity the client authenticates (the IP that must
-       appear in the certificate's IP SAN). This is DELIBERATELY separate from
-       the TCP destination: normally they are the same, but when connecting
-       through a proxy the client still authenticates the REAL server's
-       identity, not the proxy's address. Defaults to the connect IP, so
-       ordinary usage is unchanged; override as argv[4] for proxy testing. */
+    // Allow separate IP check in case server is behind a proxy
     const char *expected_ip = (argc > 4) ? argv[4] : server_ip;
 
     std::string username;
@@ -267,10 +214,8 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    /* ---------- connect ---------- */
-
+    // Set up socket connection
     int client_fd = socket(AF_INET, SOCK_STREAM, 0);
-
     if (client_fd < 0) {
         std::cerr << "Socket creation failed\n";
         return 1;
@@ -300,10 +245,8 @@ int main(int argc, char *argv[])
                   << " is a different host -- e.g. a proxy).\n";
     }
 
-    /* ---------- Phase 3: authenticate the server BEFORE any DH ---------- */
-
+    // Authenticate server certificate
     std::string auth_why;
-
     X509_STORE *ca_store = certs::load_ca_store(ca_path, &auth_why);
     if (ca_store == nullptr) {
         std::cerr << "Cannot load trusted CA (" << ca_path << "): "
@@ -316,8 +259,6 @@ int main(int argc, char *argv[])
     std::cout.flush();
 
     if (!certs::client_verify_auth(client_fd, ca_store, expected_ip, &auth_why)) {
-        /* §4.1: on ANY validation failure the client aborts immediately and
-           does not proceed to DH or reveal a username. */
         std::cerr << "[AUTH] server authentication FAILED: " << auth_why
                   << "\n[AUTH] Aborting before DH. No data was sent.\n";
         X509_STORE_free(ca_store);
@@ -330,8 +271,7 @@ int main(int argc, char *argv[])
                  "proven.\n";
     std::cout.flush();
 
-    /* ---------- Diffie-Hellman ---------- */
-
+    // Diffie-Hellman handshake
     std::cout << "Performing Diffie-Hellman key exchange "
                  "(RFC 3526 group 14, 2048-bit)...\n";
     std::cout.flush();
@@ -348,9 +288,8 @@ int main(int argc, char *argv[])
 
     unsigned char key[crypto::KEY_BYTES];
     crypto::derive_key(shared, sizeof(shared), key);
-    OPENSSL_cleanse(shared, sizeof(shared));    /* raw secret, done with it */
+    OPENSSL_cleanse(shared, sizeof(shared));
 
-    /* Fingerprint only: never the private exponent, raw secret or key. */
     std::cout << "Key established. Fingerprint: "
               << crypto::fingerprint(key) << "\n"
               << "(this must match the fingerprint printed by the server "
@@ -360,8 +299,7 @@ int main(int argc, char *argv[])
     ch.init(key, crypto::Role::Client);
     OPENSSL_cleanse(key, sizeof(key));
 
-    /* ---------- registration (encrypted) ---------- */
-
+    // Register user over encrypted channel
     if (!ch.send_msg(client_fd, "REGISTER|" + username)) {
         std::cerr << "Failed to send registration\n";
         close(client_fd);
@@ -369,7 +307,6 @@ int main(int argc, char *argv[])
     }
 
     std::string response;
-
     if (ch.recv_msg(client_fd, response) != crypto::RecvResult::Ok) {
         std::cerr << "Server disconnected during registration\n";
         close(client_fd);
@@ -383,22 +320,17 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    /* ---------- chat ---------- */
-
-    /* Phase 4: per-peer E2E sessions. Constructed with our own username so
-       the glare rule can be evaluated deterministically. Shared between this
-       (input) thread and the receiver thread; E2EManager does its own
-       locking and never hands out references to internal state. */
+    // Set up chat session and start listener thread
     e2e::E2EManager e2e_mgr(username);
 
     std::atomic<bool> running(true);
     std::thread receiver(receive_messages, client_fd, &ch, &e2e_mgr, &running);
 
-    /* §1.3: the currently selected chat partner. */
     std::string selected;
 
     std::cout << "Commands: @user msg | /chat user | /e2e user | /who | /quit\n";
 
+    // Main input loop
     while (running.load()) {
 
         std::cout << "> ";
@@ -415,7 +347,7 @@ int main(int argc, char *argv[])
         if (input.empty())
             continue;
 
-        /* /quit */
+        // Quit command
         if (input == "/quit") {
             ch.send_msg(client_fd, "QUIT");
             running.store(false);
@@ -423,7 +355,7 @@ int main(int argc, char *argv[])
             break;
         }
 
-        /* /who */
+        // Who command
         if (input == "/who") {
             if (!ch.send_msg(client_fd, "WHO")) {
                 std::cout << "Failed to send.\n";
@@ -432,7 +364,7 @@ int main(int argc, char *argv[])
             continue;
         }
 
-        /* /e2e username -- start an end-to-end key exchange (§1.3) */
+        // Initiate E2E key exchange
         if (input == "/e2e" || input.rfind("/e2e ", 0) == 0) {
 
             std::string target = (input.size() > 5) ? input.substr(5) : "";
@@ -471,11 +403,10 @@ int main(int argc, char *argv[])
             continue;
         }
 
-        /* /chat username -- switch partner without sending */
+        // Select partner without sending
         if (input.rfind("/chat ", 0) == 0) {
             std::string target = input.substr(6);
 
-            /* trim surrounding spaces */
             while (!target.empty() && target.front() == ' ')
                 target.erase(target.begin());
             while (!target.empty() && target.back() == ' ')
@@ -491,7 +422,7 @@ int main(int argc, char *argv[])
             continue;
         }
 
-        /* @username message -- send and select */
+        // Direct message and select
         if (input[0] == '@') {
             size_t space = input.find(' ');
 
@@ -510,7 +441,6 @@ int main(int argc, char *argv[])
 
             selected = recipient;
 
-            /* E2E-wrapped when a session exists, plaintext otherwise. */
             if (!send_chat(client_fd, &ch, &e2e_mgr, recipient, message)) {
                 std::cout << "Failed to send.\n";
                 break;
@@ -519,11 +449,7 @@ int main(int argc, char *argv[])
             continue;
         }
 
-        /*
-         * §1.3: "Any input that does not match one of the recognized command
-         * tags should be treated as a plain chat message to whichever user is
-         * currently selected."
-         */
+        // Default: send to currently selected target
         if (selected.empty()) {
             std::cout << "No chat partner selected. "
                          "Use @username message or /chat username.\n";
@@ -536,6 +462,7 @@ int main(int argc, char *argv[])
         }
     }
 
+    // Clean up
     running.store(false);
     shutdown(client_fd, SHUT_RDWR);
 
