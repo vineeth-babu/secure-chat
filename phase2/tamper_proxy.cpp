@@ -1,3 +1,34 @@
+/*
+ * tamper_proxy.cpp -- CS6008 Phase 2 §3.2: tamper-detection demonstration
+ *
+ * A transparent TCP forwarder that sits between one client and the server and
+ * flips a single bit in the ciphertext of one chosen record. Everything else
+ * is passed through byte-for-byte.
+ *
+ * It needs no key and understands no cryptography. Both frame types used by
+ * this project start with a 4-byte big-endian length, so the proxy can count
+ * and modify frames without knowing whether a frame is a DH public value or
+ * an encrypted record:
+ *
+ *     DH frame     [4-byte len = 256][256-byte public value]
+ *     record       [4-byte len][8-byte counter][ciphertext][16-byte tag]
+ *
+ * Frame index 0 in each direction is the DH public value, so records start at
+ * index 1. Byte 8 of a record body is the first ciphertext byte, which is
+ * what gets flipped -- exactly the "modify a single byte of a captured
+ * ciphertext" test the assignment asks for.
+ *
+ * Usage:
+ *   ./tamper_proxy <listen_port> <server_ip> <server_port> <c2s|s2c> <frame#>
+ *
+ * Example (run on the client VM, or on the Mallory VM):
+ *   ./tamper_proxy 6000 192.168.64.2 5000 s2c 2
+ *   ./client 127.0.0.1 6000
+ *
+ * NOTE: this is a corruption test, not a man-in-the-middle attack. It cannot
+ * read anything. Building the actual MITM proxy is the separate §3.3 task.
+ */
+
 #include "net.h"
 
 #include <arpa/inet.h>
@@ -21,7 +52,10 @@ struct Direction {
     long tamper_frame;
 };
 
-/* Forward frames and modify the selected frame if required. */
+/*
+ * Forward length-prefixed frames from `in` to `out`, corrupting one byte of
+ * the chosen frame if this direction is the one being tampered with.
+ */
 static void pump(int in, int out, Direction dir, std::atomic<bool> *running)
 {
     long frame_index = 0;
@@ -49,11 +83,13 @@ static void pump(int in, int out, Direction dir, std::atomic<bool> *running)
 
         if (dir.tamper_here && frame_index == dir.tamper_frame) {
 
+            /* Body layout of a record: [8-byte counter][ciphertext][tag].
+               Offset 8 is the first ciphertext byte. */
             const size_t target = 8;
 
             if (len > target + 16) {
                 unsigned char before = body[target];
-                body[target] ^= 0x01;  /* flip exactly one bit */
+                body[target] ^= 0x01;       /* flip exactly one bit */
 
                 std::printf("[proxy] %s frame %ld: flipped one bit of "
                             "ciphertext byte %zu (0x%02X -> 0x%02X)\n",

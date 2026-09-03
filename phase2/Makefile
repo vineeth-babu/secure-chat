@@ -1,3 +1,9 @@
+# CS6008 Phase 2 -- Makefile
+#
+#   make            build server, client, dh_test, tamper_proxy
+#   make check      build, run the DH test, and prove no prohibited API is used
+#   make clean
+
 CXX      := g++
 CXXFLAGS := -std=c++17 -O2 -Wall -Wextra -pthread
 LDLIBS   := -lcrypto -pthread
@@ -21,7 +27,8 @@ tamper_proxy: tamper_proxy.cpp net.cpp net.h
 mitm_proxy: mitm_proxy.cpp $(COMMON) dh.h crypto.h net.h
 	$(CXX) $(CXXFLAGS) mitm_proxy.cpp $(COMMON) -o mitm_proxy $(LDLIBS)
 
-# Run the tests and check for prohibited APIs
+# Evidence for the report: no prohibited API anywhere, and no BN_mod_exp
+# outside the test harness.
 check: all
 	@echo "== running the DH test harness =="
 	@./dh_test

@@ -1,3 +1,16 @@
+/*
+ * client.cpp -- CS6008 Phase 2: chat client with DH + AES-256-GCM
+ *
+ * Command interface (assignment §1.3):
+ *     @username message   send to username, and select username
+ *     /chat username      select username without sending
+ *     /who                list online users
+ *     /quit               disconnect cleanly and exit
+ *     anything else       sent as a plain chat message to the selected user
+ *
+ * Usage: ./client [server-ip] [port]
+ */
+
 #include "dh.h"
 #include "crypto.h"
 #include "net.h"
@@ -17,6 +30,9 @@
 static const char *DEFAULT_SERVER_IP = "192.168.64.2";
 static const int   DEFAULT_PORT      = 5000;
 
+/* ------------------------------------------------------------------ */
+/* receiver thread                                                     */
+/* ------------------------------------------------------------------ */
 
 static void receive_messages(int socket_fd,
                              crypto::SecureChannel *ch,
@@ -52,13 +68,12 @@ static void receive_messages(int socket_fd,
             }
 
             running->store(false);
-
-            // Wake up the main thread if it is waiting for input
+            /* Unblock the main thread, which is sitting in getline(). */
             shutdown(socket_fd, SHUT_RDWR);
             break;
         }
 
-        // Display messages received from another user
+        /* Incoming chat message */
         if (line.rfind("FROM|", 0) == 0) {
 
             size_t separator = line.find('|', 5);
@@ -74,12 +89,14 @@ static void receive_messages(int socket_fd,
             continue;
         }
 
-        // Display other responses from the server
         std::cout << "\nServer: " << line << "\n> ";
         std::cout.flush();
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* main                                                                */
+/* ------------------------------------------------------------------ */
 
 int main(int argc, char *argv[])
 {
@@ -94,7 +111,8 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    // Create and connect the TCP socket
+    /* ---------- connect ---------- */
+
     int client_fd = socket(AF_INET, SOCK_STREAM, 0);
 
     if (client_fd < 0) {
@@ -121,7 +139,8 @@ int main(int argc, char *argv[])
 
     std::cout << "Connected to " << server_ip << ":" << port << "\n";
 
-    // Perform Diffie-Hellman key exchange
+    /* ---------- Diffie-Hellman ---------- */
+
     std::cout << "Performing Diffie-Hellman key exchange "
                  "(RFC 3526 group 14, 2048-bit)...\n";
     std::cout.flush();
@@ -136,12 +155,11 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    // Derive the AES key from the shared secret
     unsigned char key[crypto::KEY_BYTES];
     crypto::derive_key(shared, sizeof(shared), key);
-    OPENSSL_cleanse(shared, sizeof(shared));
+    OPENSSL_cleanse(shared, sizeof(shared));    /* raw secret, done with it */
 
-    // Show only the fingerprint, not the actual key
+    /* Fingerprint only: never the private exponent, raw secret or key. */
     std::cout << "Key established. Fingerprint: "
               << crypto::fingerprint(key) << "\n"
               << "(this must match the fingerprint printed by the server "
@@ -151,7 +169,8 @@ int main(int argc, char *argv[])
     ch.init(key, crypto::Role::Client);
     OPENSSL_cleanse(key, sizeof(key));
 
-    // Register with the server through the encrypted channel
+    /* ---------- registration (encrypted) ---------- */
+
     if (!ch.send_msg(client_fd, "REGISTER|" + username)) {
         std::cerr << "Failed to send registration\n";
         close(client_fd);
@@ -173,11 +192,12 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    // Start the thread that receives messages
+    /* ---------- chat ---------- */
+
     std::atomic<bool> running(true);
     std::thread receiver(receive_messages, client_fd, &ch, &running);
 
-    // Currently selected user for normal messages
+    /* §1.3: the currently selected chat partner. */
     std::string selected;
 
     std::cout << "Commands: @user msg | /chat user | /who | /quit\n";
@@ -198,7 +218,7 @@ int main(int argc, char *argv[])
         if (input.empty())
             continue;
 
-        // Quit the chat
+        /* /quit */
         if (input == "/quit") {
             ch.send_msg(client_fd, "QUIT");
             running.store(false);
@@ -206,7 +226,7 @@ int main(int argc, char *argv[])
             break;
         }
 
-        // List online users
+        /* /who */
         if (input == "/who") {
             if (!ch.send_msg(client_fd, "WHO")) {
                 std::cout << "Failed to send.\n";
@@ -215,11 +235,11 @@ int main(int argc, char *argv[])
             continue;
         }
 
-        // Select a user without sending a message
+        /* /chat username -- switch partner without sending */
         if (input.rfind("/chat ", 0) == 0) {
             std::string target = input.substr(6);
 
-            // Remove spaces around the username
+            /* trim surrounding spaces */
             while (!target.empty() && target.front() == ' ')
                 target.erase(target.begin());
             while (!target.empty() && target.back() == ' ')
@@ -235,7 +255,7 @@ int main(int argc, char *argv[])
             continue;
         }
 
-        // Send a message and select that user
+        /* @username message -- send and select */
         if (input[0] == '@') {
             size_t space = input.find(' ');
 
@@ -263,7 +283,11 @@ int main(int argc, char *argv[])
             continue;
         }
 
-        // Send normal input to the currently selected user
+        /*
+         * §1.3: "Any input that does not match one of the recognized command
+         * tags should be treated as a plain chat message to whichever user is
+         * currently selected."
+         */
         if (selected.empty()) {
             std::cout << "No chat partner selected. "
                          "Use @username message or /chat username.\n";
