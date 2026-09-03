@@ -244,6 +244,8 @@ int main() {
         std::ref(running)
     );
 
+    std::string selected;
+
 
     // Main input loop
     while (running) {
@@ -259,6 +261,10 @@ int main() {
             )) {
 
             break;
+        }
+
+        if (input.empty()) {
+            continue;
         }
 
 
@@ -288,6 +294,43 @@ int main() {
                 client_fd,
                 "WHO"
             );
+
+            continue;
+        }
+
+
+        // Switch the selected chat partner
+        if (input.rfind("/chat ", 0) == 0) {
+
+            std::string target =
+                input.substr(6);
+
+            while (!target.empty() &&
+                   target.front() == ' ') {
+
+                target.erase(target.begin());
+            }
+
+            while (!target.empty() &&
+                   target.back() == ' ') {
+
+                target.pop_back();
+            }
+
+            if (target.empty()) {
+
+                std::cout
+                    << "Usage: /chat username\n";
+
+                continue;
+            }
+
+            selected = target;
+
+            std::cout
+                << "Now chatting with "
+                << selected
+                << "\n";
 
             continue;
         }
@@ -330,6 +373,8 @@ int main() {
                 continue;
             }
 
+            selected = recipient;
+
 
             send_line(
                 client_fd,
@@ -343,10 +388,23 @@ int main() {
         }
 
 
-        std::cout
-            << "Unknown command. "
-            << "Use @username message, "
-            << "/who, or /quit.\n";
+        if (selected.empty()) {
+
+            std::cout
+                << "No chat partner selected. "
+                << "Use @username message or /chat username.\n";
+
+            continue;
+        }
+
+
+        send_line(
+            client_fd,
+            "MSG|" +
+            selected +
+            "|" +
+            input
+        );
     }
 
 
