@@ -1,44 +1,3 @@
-/*
- * mitm_proxy.cpp -- CS6008 Phase 2 §3.3: active man-in-the-middle
- *
- * Demonstrates that unauthenticated Diffie-Hellman establishes a shared
- * secret with *whoever answers the socket*, not with a verified identity.
- * The proxy runs TWO independent DH exchanges and sits in the clear between
- * them:
- *
- *     Victim client  <-- DH session 1 -->  MITM  <-- DH session 2 -->  Server
- *          (MITM plays the server)                    (MITM plays the client)
- *
- * The victim derives a key with the MITM believing it is the server; the
- * server derives a key with the MITM believing it is the client. The MITM
- * holds BOTH keys, so it decrypts every record from one side and re-encrypts
- * it for the other. Both endpoints see a perfectly ordinary, "secure"
- * session. Neither can tell the difference -- which is exactly the point.
- *
- * This is why Phase 3 adds certificates: an authenticated server key that the
- * MITM cannot forge closes this gap.
- *
- * Constraints honoured (identical to the rest of Phase 2):
- *   - No <openssl/dh.h>, no DH/ECDH API, no TLS/SSL.
- *   - No BN_mod_exp() on the protocol path -- every exponentiation reuses
- *     dh::my_mod_exp() via the existing dh.* primitives.
- *   - AES-GCM authentication is NOT weakened. The MITM does not forge or skip
- *     a single tag; it holds legitimate keys for both links because each side
- *     willingly ran DH with it.
- *   - DH shared secrets and AES keys are never printed. Only fingerprints and
- *     intercepted application plaintext are shown.
- *
- * Build (from the phase2 directory):
- *   g++ -std=c++17 -O2 -Wall -Wextra -pthread \
- *       mitm_proxy.cpp dh.cpp crypto.cpp net.cpp -o mitm_proxy -lcrypto
- *
- * Run:
- *   ./mitm_proxy <listen_port> <server_ip> <server_port>
- *   ./mitm_proxy 7000 192.168.64.2 5000
- * Then point the victim at the proxy:
- *   ./client 127.0.0.1 7000
- */
-
 #include "dh.h"
 #include "crypto.h"
 #include "net.h"
@@ -59,21 +18,7 @@
 #include <string>
 #include <thread>
 
-/* ------------------------------------------------------------------ */
-/* victim-facing DH: the MITM plays the SERVER                         */
-/* ------------------------------------------------------------------ */
-
-/*
- * The real client calls dh::run_handshake, which writes its public value and
- * then reads ours -- so on this side we must read the client's value and send
- * our own. We cannot call run_handshake here (it would run the wrong role and
- * generate its own key we could never see), so we drive the same public dh::
- * primitives directly. The wire framing is byte-identical to run_handshake:
- *
- *     [4-byte big-endian length = 256][256-byte big-endian public value]
- *
- * On success, shared_out holds the raw secret shared with the victim.
- */
+/* Perform the victim-facing DH exchange with the MITM acting as the server. */
 static bool dh_as_server(int fd, unsigned char shared_out[dh::PUB_BYTES],
                          std::string *why)
 {
@@ -106,8 +51,7 @@ static bool dh_as_server(int fd, unsigned char shared_out[dh::PUB_BYTES],
             goto done;
         }
 
-        /* ---- read the victim's public value FIRST (we are the server) --- */
-
+        /* Read the victim's public value first. */
         if (!net::read_exact(fd, &netlen, sizeof(netlen))) {
             if (why) *why = "victim closed during DH";
             goto done;
@@ -121,8 +65,7 @@ static bool dh_as_server(int fd, unsigned char shared_out[dh::PUB_BYTES],
             goto done;
         }
 
-        /* ---- now send ours ---- */
-
+        /* Send the MITM public value to the victim. */
         netlen = htonl(static_cast<uint32_t>(dh::PUB_BYTES));
         if (!net::write_all(fd, &netlen, sizeof(netlen)) ||
             !net::write_all(fd, mine, dh::PUB_BYTES)) {
@@ -130,7 +73,7 @@ static bool dh_as_server(int fd, unsigned char shared_out[dh::PUB_BYTES],
             goto done;
         }
 
-        /* Reflection guard, mirroring run_handshake. */
+        /* Reject a reflected public value. */
         if (CRYPTO_memcmp(peer, mine, dh::PUB_BYTES) == 0) {
             if (why) *why = "victim reflected our public value";
             goto done;
@@ -149,26 +92,16 @@ done:
     return ok;
 }
 
-/* ------------------------------------------------------------------ */
-/* relay: decrypt on the "in" channel, re-encrypt on the "out" channel */
-/* ------------------------------------------------------------------ */
-
 struct RelayArgs {
     int in_fd;
     int out_fd;
-    crypto::SecureChannel *in_ch;   /* channel to DECRYPT the source     */
-    crypto::SecureChannel *out_ch;  /* channel to RE-ENCRYPT for the dest */
-    const char *label;              /* "client->server" / "server->client" */
+    crypto::SecureChannel *in_ch;
+    crypto::SecureChannel *out_ch;
+    const char *label;
     std::atomic<bool> *running;
 };
 
-/*
- * Pump one direction. Each application record is decrypted with the key we
- * share with the sender, logged in the clear (the whole point of the demo),
- * then re-encrypted with the key we share with the recipient. The two
- * SecureChannels keep their own independent counters, so the re-encrypted
- * stream is a valid, correctly-sequenced session from the recipient's view.
- */
+/* Decrypt messages from one side and re-encrypt them for the other side. */
 static void relay_dir(RelayArgs a)
 {
     std::string plaintext;
@@ -193,11 +126,11 @@ static void relay_dir(RelayArgs a)
             break;
         }
 
-        /* ---- INTERCEPTED PLAINTEXT: the evidence for the report ---- */
+        /* Display the intercepted plaintext. */
         std::printf("[mitm] %s  |  %s\n", a.label, plaintext.c_str());
         std::fflush(stdout);
 
-        /* Forward it, re-encrypted under the other link's key. */
+        /* Re-encrypt and forward the message. */
         if (!a.out_ch->send_msg(a.out_fd, plaintext)) {
             std::printf("[mitm] %s: failed to forward record\n", a.label);
             std::fflush(stdout);
@@ -210,15 +143,11 @@ static void relay_dir(RelayArgs a)
     shutdown(a.out_fd, SHUT_RDWR);
 }
 
-/* ------------------------------------------------------------------ */
-/* one intercepted session                                             */
-/* ------------------------------------------------------------------ */
-
+/* Handle one victim connection. */
 static void handle_victim(int victim_fd, const char *server_ip,
                           int server_port)
 {
-    /* ---- connect to the real server ---- */
-
+    /* Connect to the real server. */
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
         std::perror("[mitm] socket");
@@ -247,8 +176,7 @@ static void handle_victim(int victim_fd, const char *server_ip,
                 "%s:%d\n", server_ip, server_port);
     std::fflush(stdout);
 
-    /* ---- DH session 1: with the victim, MITM as server ---- */
-
+    /* DH exchange with the victim. */
     unsigned char shared_v[dh::PUB_BYTES];
     std::string why;
 
@@ -260,9 +188,7 @@ static void handle_victim(int victim_fd, const char *server_ip,
         return;
     }
 
-    /* ---- DH session 2: with the real server, MITM as client ---- */
-    /* run_handshake plays exactly the client role the server expects. */
-
+    /* DH exchange with the real server. */
     unsigned char shared_s[dh::PUB_BYTES];
 
     if (!dh::run_handshake(server_fd, shared_s, &why)) {
@@ -274,8 +200,7 @@ static void handle_victim(int victim_fd, const char *server_ip,
         return;
     }
 
-    /* ---- derive both keys (same KDF the endpoints use) ---- */
-
+    /* Derive a separate key for each connection. */
     unsigned char key_v[crypto::KEY_BYTES];
     unsigned char key_s[crypto::KEY_BYTES];
     crypto::derive_key(shared_v, sizeof(shared_v), key_v);
@@ -283,32 +208,15 @@ static void handle_victim(int victim_fd, const char *server_ip,
     OPENSSL_cleanse(shared_v, sizeof(shared_v));
     OPENSSL_cleanse(shared_s, sizeof(shared_s));
 
-    /*
-     * The two fingerprints differ, because they are two different keys from
-     * two different exchanges. The victim will print the FIRST; the server
-     * logs the SECOND. In a legitimate session those two would be equal --
-     * their inequality here IS the man-in-the-middle, though neither endpoint
-     * ever sees both to notice.
-     */
     std::printf("[mitm] key with victim  (fingerprint): %s\n",
                 crypto::fingerprint(key_v).c_str());
     std::printf("[mitm] key with server  (fingerprint): %s\n",
                 crypto::fingerprint(key_s).c_str());
     std::fflush(stdout);
 
-    /*
-     * Role assignment is the subtle part. On each link the MITM must adopt
-     * the OPPOSITE role of the endpoint it faces, so the direction tags used
-     * for nonces line up:
-     *
-     *   Victim runs as Client  ->  MITM faces it as Server  (key_v)
-     *   Server runs as Server   ->  MITM faces it as Client  (key_s)
-     *
-     * Get this wrong and the nonce direction tags mismatch, so every record
-     * fails to decrypt.
-     */
-    crypto::SecureChannel ch_victim;   /* MITM <-> victim */
-    crypto::SecureChannel ch_server;   /* MITM <-> server */
+    /* Use the opposite role on each connection. */
+    crypto::SecureChannel ch_victim;
+    crypto::SecureChannel ch_server;
     ch_victim.init(key_v, crypto::Role::Server);
     ch_server.init(key_s, crypto::Role::Client);
     OPENSSL_cleanse(key_v, sizeof(key_v));
@@ -318,8 +226,7 @@ static void handle_victim(int victim_fd, const char *server_ip,
     std::printf("[mitm] ---- intercepted application plaintext ----\n");
     std::fflush(stdout);
 
-    /* ---- relay both directions ---- */
-
+    /* Relay messages in both directions. */
     std::atomic<bool> running(true);
 
     RelayArgs c2s{victim_fd, server_fd, &ch_victim, &ch_server,
@@ -339,10 +246,6 @@ static void handle_victim(int victim_fd, const char *server_ip,
     std::printf("[mitm] session finished\n");
     std::fflush(stdout);
 }
-
-/* ------------------------------------------------------------------ */
-/* main                                                                */
-/* ------------------------------------------------------------------ */
 
 int main(int argc, char *argv[])
 {
@@ -390,8 +293,7 @@ int main(int argc, char *argv[])
     std::printf("[mitm]     ./client 127.0.0.1 %d\n\n", listen_port);
     std::fflush(stdout);
 
-    /* One victim at a time keeps the demo output readable. Each is handled to
-       completion before the next is accepted. */
+    /* Handle one victim connection at a time. */
     while (true) {
         int victim_fd = accept(listen_fd, nullptr, nullptr);
         if (victim_fd < 0) {

@@ -1,7 +1,3 @@
-/*
- * crypto.cpp -- CS6008 Phase 2
- */
-
 #include "crypto.h"
 #include "net.h"
 
@@ -15,10 +11,6 @@
 #include <vector>
 
 namespace crypto {
-
-/* ------------------------------------------------------------------ */
-/* helpers                                                             */
-/* ------------------------------------------------------------------ */
 
 static void put_u32_be(unsigned char *p, uint32_t v)
 {
@@ -50,7 +42,7 @@ static uint64_t get_u64_be(const unsigned char *p)
     return v;
 }
 
-/* nonce = [4-byte direction tag][8-byte counter] */
+// Nonce contains a direction value and message counter
 static void build_nonce(unsigned char nonce[NONCE_BYTES],
                         uint32_t dir, uint64_t ctr)
 {
@@ -58,9 +50,6 @@ static void build_nonce(unsigned char nonce[NONCE_BYTES],
     put_u64_be(nonce + 4, ctr);
 }
 
-/* ------------------------------------------------------------------ */
-/* key derivation and fingerprint                                      */
-/* ------------------------------------------------------------------ */
 
 static const char KEY_LABEL[] = "CS6008-P2-KEY-v1";
 static const char FP_LABEL[]  = "CS6008-P2-FP-v1";
@@ -93,12 +82,10 @@ void derive_key(const unsigned char *shared, size_t shared_len,
 {
     unsigned char digest[32];
 
-    /* sizeof(LABEL) - 1 excludes the terminating NUL, so the label is a
-       fixed 16 bytes on both sides. */
+    // Do not include the terminating null character in the label
     if (!sha256_two(KEY_LABEL, sizeof(KEY_LABEL) - 1,
                     shared, shared_len, digest)) {
-        /* A digest failure means OpenSSL is broken; refuse to continue with
-           a zero key rather than pretending we have one. */
+        // Do not continue with an invalid key
         std::memset(key_out, 0, KEY_BYTES);
         return;
     }
@@ -117,7 +104,7 @@ std::string fingerprint(const unsigned char key[KEY_BYTES])
     static const char *hexdigits = "0123456789ABCDEF";
     std::string out;
 
-    /* First 8 bytes, grouped in fours for legibility in a screenshot. */
+    // Show the first 8 bytes in a readable format
     for (int i = 0; i < 8; i++) {
         if (i > 0 && i % 2 == 0)
             out += ' ';
@@ -129,9 +116,6 @@ std::string fingerprint(const unsigned char key[KEY_BYTES])
     return out;
 }
 
-/* ------------------------------------------------------------------ */
-/* SecureChannel                                                       */
-/* ------------------------------------------------------------------ */
 
 SecureChannel::SecureChannel()
     : send_dir_(0), recv_dir_(0), send_ctr_(0), recv_ctr_(0), ready_(false)
@@ -148,11 +132,10 @@ void SecureChannel::init(const unsigned char key[KEY_BYTES], Role role)
 {
     std::memcpy(key_, key, KEY_BYTES);
 
-    /* Direction tags: distinct constants so the two directions can share one
-       key without ever sharing a nonce. */
+    // Use different values for each direction
     if (role == Role::Client) {
-        send_dir_ = 1;      /* client -> server */
-        recv_dir_ = 2;      /* server -> client */
+        send_dir_ = 1;
+        recv_dir_ = 2;
     } else {
         send_dir_ = 2;
         recv_dir_ = 1;
@@ -173,8 +156,7 @@ bool SecureChannel::send_msg(int fd, const std::string &plaintext)
 
     std::lock_guard<std::mutex> lock(send_mtx_);
 
-    /* 2^64 records is unreachable in practice, but wrapping the counter
-       would reuse a nonce, so refuse rather than wrap. */
+    // Do not allow the counter to wrap and reuse a nonce
     if (send_ctr_ == UINT64_MAX)
         return false;
 
@@ -215,8 +197,7 @@ bool SecureChannel::send_msg(int fd, const std::string &plaintext)
         if (EVP_EncryptInit_ex(ctx, nullptr, nullptr, key_, nonce) != 1)
             break;
 
-        /* The counter travels in clear text, so bind it as additional
-           authenticated data: altering it in flight breaks the tag. */
+        // Authenticate the counter along with the encrypted data
         if (EVP_EncryptUpdate(ctx, nullptr, &outl,
                               ctr_be, static_cast<int>(CTR_BYTES)) != 1)
             break;
@@ -228,7 +209,7 @@ bool SecureChannel::send_msg(int fd, const std::string &plaintext)
                                   static_cast<int>(ptlen)) != 1)
                 break;
             if (static_cast<size_t>(outl) != ptlen)
-                break;      /* GCM is a stream mode: ct length == pt length */
+                break;
         }
 
         int finl = 0;
@@ -247,7 +228,8 @@ bool SecureChannel::send_msg(int fd, const std::string &plaintext)
     if (!ok)
         return false;
 
-    send_ctr_++;    /* only after a successful encryption */
+    // Increment only after encryption succeeds
+    send_ctr_++;
 
     return net::write_all(fd, frame.data(), frame.size());
 }
@@ -259,14 +241,13 @@ RecvResult SecureChannel::recv_msg(int fd, std::string &plaintext_out)
 
     plaintext_out.clear();
 
-    /* ---- length, validated before anything is allocated ---- */
-
     unsigned char hdr[HDR_BYTES];
     if (!net::read_exact(fd, hdr, HDR_BYTES))
         return RecvResult::Closed;
 
     const uint32_t bodylen = get_u32_be(hdr);
 
+    // Check the received length before allocating memory
     if (bodylen < MIN_BODY_BYTES || bodylen > MAX_BODY_BYTES)
         return RecvResult::ProtocolError;
 
@@ -274,13 +255,9 @@ RecvResult SecureChannel::recv_msg(int fd, std::string &plaintext_out)
     if (!net::read_exact(fd, body.data(), bodylen))
         return RecvResult::Closed;
 
-    /* ---- counter: must match exactly what we expect ---- */
-
     const uint64_t ctr = get_u64_be(body.data());
 
-    /* Strict sequencing. A replayed, reordered or dropped record is rejected
-       here rather than being decrypted, which also means a replay can never
-       reuse a nonce against us. */
+    // Messages must arrive in the expected order
     if (ctr != recv_ctr_)
         return RecvResult::ProtocolError;
 
@@ -296,8 +273,7 @@ RecvResult SecureChannel::recv_msg(int fd, std::string &plaintext_out)
     if (ctx == nullptr)
         return RecvResult::ProtocolError;
 
-    /* ctlen + 1 so the buffer is never empty: pt.data() must stay a valid
-       pointer even for a zero-length message. */
+    // Keep the buffer valid even for an empty message
     std::vector<unsigned char> pt(ctlen + 1);
     bool ok = false;
     int outl = 0;
@@ -314,9 +290,10 @@ RecvResult SecureChannel::recv_msg(int fd, std::string &plaintext_out)
         if (EVP_DecryptInit_ex(ctx, nullptr, nullptr, key_, nonce) != 1)
             break;
 
+        // Authenticate the counter the same way as the sender
         if (EVP_DecryptUpdate(ctx, nullptr, &outl,
                               body.data(), static_cast<int>(CTR_BYTES)) != 1)
-            break;      /* the counter as AAD, exactly as the sender bound it */
+            break;
 
         if (ctlen > 0) {
             if (EVP_DecryptUpdate(ctx, pt.data(), &outl,
@@ -324,7 +301,7 @@ RecvResult SecureChannel::recv_msg(int fd, std::string &plaintext_out)
                 break;
         }
 
-        /* The tag must be installed BEFORE DecryptFinal. */
+        // Set the authentication tag before checking the final result
         if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG,
                                 static_cast<int>(TAG_BYTES),
                                 const_cast<unsigned char *>(tag)) != 1)
@@ -332,9 +309,7 @@ RecvResult SecureChannel::recv_msg(int fd, std::string &plaintext_out)
 
         int finl = 0;
 
-        /* This is the authentication check. A non-positive return means the
-           tag did not verify: the record was altered, replayed or forged.
-           No plaintext is produced and the caller aborts the connection. */
+        // DecryptFinal verifies the authentication tag
         if (EVP_DecryptFinal_ex(ctx, pt.data() + ctlen, &finl) <= 0)
             break;
 
@@ -348,7 +323,8 @@ RecvResult SecureChannel::recv_msg(int fd, std::string &plaintext_out)
         return RecvResult::AuthFailure;
     }
 
-    recv_ctr_++;    /* only after the tag verified */
+    // Move to the next expected message counter
+    recv_ctr_++;
 
     plaintext_out.assign(reinterpret_cast<const char *>(pt.data()), ctlen);
     OPENSSL_cleanse(pt.data(), pt.size());
@@ -356,4 +332,4 @@ RecvResult SecureChannel::recv_msg(int fd, std::string &plaintext_out)
     return RecvResult::Ok;
 }
 
-}  /* namespace crypto */
+}  // namespace crypto

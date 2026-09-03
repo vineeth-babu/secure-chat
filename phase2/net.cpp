@@ -1,7 +1,3 @@
-/*
- * net.cpp -- CS6008 Phase 2
- */
-
 #include "net.h"
 
 #include <sys/socket.h>
@@ -17,11 +13,11 @@ bool read_exact(int fd, void *buf, size_t n)
         ssize_t r = recv(fd, p, n, 0);
 
         if (r == 0)
-            return false;                   /* peer closed the connection */
+            return false;   // Connection was closed by the peer
 
         if (r < 0) {
             if (errno == EINTR)
-                continue;                   /* interrupted, retry         */
+                continue;   // Retry if the system call was interrupted
             return false;
         }
 
@@ -37,8 +33,7 @@ bool write_all(int fd, const void *buf, size_t n)
     const unsigned char *p = static_cast<const unsigned char *>(buf);
 
     while (n > 0) {
-        /* MSG_NOSIGNAL: a write to a closed socket returns EPIPE instead of
-           killing the process with SIGPIPE. */
+        // Prevent SIGPIPE if the other side has already closed the socket
         ssize_t w = send(fd, p, n, MSG_NOSIGNAL);
 
         if (w <= 0) {
@@ -54,4 +49,4 @@ bool write_all(int fd, const void *buf, size_t n)
     return true;
 }
 
-}  /* namespace net */
+}  // namespace net
