@@ -1,21 +1,18 @@
 /*
- * server.cpp -- CS6008 Phase 2: chat server with per-client DH + AES-256-GCM
+ * server.cpp -- chat server with per-client DH + AES-256-GCM
  *
- * Application protocol is unchanged from Phase 1:
+ * Application protocol:
  *     REGISTER|username   ->  OK|Registered  /  ERROR|reason
  *     WHO                 ->  USERS|a,b
  *     MSG|recipient|text   ->  (relayed as) FROM|sender|text
  *     QUIT
  *
- * What Phase 2 changes: every one of those messages now travels inside an
- * authenticated encrypted record, including REGISTER (assignment §3.1 --
- * "not just chat messages but also any login/registration exchange").
+ * Every one of these now travels inside an authenticated encrypted record,
+ * including REGISTER. Each client gets its own independent DH exchange and
+ * its own key -- C1<->S and C2<->S share nothing.
  *
- * Each client gets its OWN independent DH exchange and therefore its own key
- * (§3.1). C1 <-> S and C2 <-> S share nothing.
- *
- * The server still decrypts and logs relayed messages, which is required for
- * the Phase 1/2 verification and is exactly the property Phase 4 removes.
+ * The server still decrypts and logs relayed messages here. That changes
+ * once end-to-end encryption is added on top later.
  */
 
 #include "dh.h"
@@ -40,19 +37,17 @@
 static const int PORT        = 5000;
 static const int MAX_CLIENTS = 2;
 
-/* ------------------------------------------------------------------ */
-/* per-connection state                                                */
-/* ------------------------------------------------------------------ */
+// per-connection state
 
 /*
- * One Session per connected client. Holds that client's own key and its own
- * send/receive counters -- this is what makes the two links independent.
+ * One Session per connected client, holding that client's own key and its
+ * own send/receive counters -- this is what keeps the two links independent.
  *
- * Held by shared_ptr: a thread relaying a message to another client copies
- * the pointer under the map lock, so the Session (and its fd) stays alive
- * even if the owner disconnects mid-relay. The fd is closed by the
- * destructor, i.e. when the last reference goes away, which removes the
- * classic "fd closed and reused while another thread writes to it" race.
+ * Held by shared_ptr: a thread relaying to another client copies the
+ * pointer under the map lock, so the Session (and its fd) stays alive even
+ * if the owner disconnects mid-relay. The fd only gets closed once the last
+ * reference goes away, which avoids the classic "fd closed and reused while
+ * another thread is still writing to it" bug.
  */
 struct Session {
     int fd = -1;
@@ -70,9 +65,7 @@ using SessionPtr = std::shared_ptr<Session>;
 static std::map<std::string, SessionPtr> clients;   /* username -> session */
 static std::mutex clients_mutex;
 
-/* ------------------------------------------------------------------ */
-/* helpers                                                             */
-/* ------------------------------------------------------------------ */
+// helpers
 
 static std::string peer_string(const sockaddr_in &addr)
 {
@@ -81,14 +74,13 @@ static std::string peer_string(const sockaddr_in &addr)
     return std::string(ip) + ":" + std::to_string(ntohs(addr.sin_port));
 }
 
-/* Report why a receive stopped, so a tampering test is unmistakable in the
-   log rather than looking like an ordinary disconnect. */
+/* Logs why a receive stopped, so a tampering attempt shows up clearly in
+   the log instead of looking like an ordinary disconnect. */
 static void log_recv_failure(const std::string &who, crypto::RecvResult r)
 {
     switch (r) {
     case crypto::RecvResult::Closed:
-        /* Ordinary hang-up. The single [DISCONNECT] line is printed by the
-           teardown code, so nothing extra is needed here. */
+        // ordinary hang-up -- the [DISCONNECT] line below covers this
         break;
     case crypto::RecvResult::AuthFailure:
         std::cout << "[SECURITY] " << who
@@ -106,19 +98,17 @@ static void log_recv_failure(const std::string &who, crypto::RecvResult r)
     std::cout.flush();
 }
 
-/* ------------------------------------------------------------------ */
-/* one client                                                          */
-/* ------------------------------------------------------------------ */
+// handling one client
 
 static void handle_client(int fd, std::string peer,
                           X509 *srv_cert, EVP_PKEY *srv_key)
 {
-    /* The Session owns the fd from here on; its destructor closes it on
-       every exit path below. */
+    // the Session owns the fd from here on; its destructor closes it on
+    // every exit path below
     SessionPtr sess = std::make_shared<Session>();
     sess->fd = fd;
 
-    /* ---------- Phase 3: prove our identity BEFORE any DH ---------- */
+    // prove our identity before any DH
 
     std::string auth_why;
     if (!certs::server_send_auth(fd, srv_cert, srv_key, &auth_why)) {
@@ -127,7 +117,7 @@ static void handle_client(int fd, std::string peer,
         return;     /* Session dtor closes fd */
     }
 
-    /* ---------- 1. independent DH exchange for THIS connection ---------- */
+    // independent DH exchange for this connection
 
     unsigned char shared[dh::PUB_BYTES];
     std::string why;
@@ -139,16 +129,16 @@ static void handle_client(int fd, std::string peer,
         return;
     }
 
-    /* ---------- 2. derive the key by hashing the shared secret ---------- */
+    // derive the key by hashing the shared secret
 
     unsigned char key[crypto::KEY_BYTES];
     crypto::derive_key(shared, sizeof(shared), key);
 
-    /* The raw secret has done its job; wipe it immediately. */
+    // the raw secret has done its job, wipe it now
     OPENSSL_cleanse(shared, sizeof(shared));
 
-    /* Only the fingerprint is ever printed -- never the exponent, the raw
-       secret or the key itself (§3.2). */
+    // only the fingerprint gets printed -- never the exponent, the raw
+    // secret or the key itself
     std::cout << "[DH-OK] " << peer
               << "  key fingerprint: " << crypto::fingerprint(key) << "\n";
     std::cout.flush();
@@ -156,7 +146,7 @@ static void handle_client(int fd, std::string peer,
     sess->ch.init(key, crypto::Role::Server);
     OPENSSL_cleanse(key, sizeof(key));
 
-    /* ---------- 3. everything from here on is encrypted ---------- */
+    // everything from here on is encrypted
 
     std::string line;
     crypto::RecvResult r = sess->ch.recv_msg(fd, line);
@@ -184,8 +174,8 @@ static void handle_client(int fd, std::string peer,
         std::lock_guard<std::mutex> lock(clients_mutex);
 
         if (clients.size() >= static_cast<size_t>(MAX_CLIENTS)) {
-            /* Send outside the lock would be tidier, but the message is one
-               small record and the lock is held only for this block. */
+            // sending outside the lock would be tidier, but this is one
+            // small record and the lock is only held for this block
             sess->ch.send_msg(fd, "ERROR|Server full");
             return;
         }
@@ -203,7 +193,7 @@ static void handle_client(int fd, std::string peer,
 
     sess->ch.send_msg(fd, "OK|Registered");
 
-    /* ---------- 4. message loop ---------- */
+    // message loop
 
     while (true) {
 
@@ -214,11 +204,11 @@ static void handle_client(int fd, std::string peer,
             break;
         }
 
-        /* QUIT */
+        // QUIT
         if (line == "QUIT")
             break;
 
-        /* WHO */
+        // WHO
         if (line == "WHO") {
             std::string response = "USERS|";
 
@@ -240,7 +230,7 @@ static void handle_client(int fd, std::string peer,
             continue;
         }
 
-        /* MSG|recipient|message */
+        // MSG|recipient|message
         if (line.rfind("MSG|", 0) == 0) {
 
             size_t first_separator = line.find('|', 4);
@@ -270,22 +260,18 @@ static void handle_client(int fd, std::string peer,
                 continue;
             }
 
-            /*
-             * The server can still read every relayed message: it holds both
-             * link keys, so it decrypts on the way in and re-encrypts on the
-             * way out. Required evidence for Phase 1/2, and exactly the
-             * property Phase 4's end-to-end layer takes away.
-             */
+            // the server can still read every relayed message here: it
+            // holds both link keys, so it decrypts on the way in and
+            // re-encrypts on the way out
             std::cout << "[RELAY] " << username << " -> " << recipient
                       << ": " << message << "\n";
             std::cout.flush();
 
             std::string forwarded = "FROM|" + username + "|" + message;
 
-            /* Encrypted under the RECIPIENT's key, with the recipient's own
-               counter. SecureChannel::send_msg holds that session's send
-               mutex, so this is safe even though we are on the sender's
-               thread. */
+            // encrypted under the RECIPIENT's key with their own counter.
+            // SecureChannel::send_msg holds that session's send mutex, so
+            // this is safe even though we're on the sender's thread
             target->ch.send_msg(target->fd, forwarded);
 
             continue;
@@ -295,12 +281,12 @@ static void handle_client(int fd, std::string peer,
             break;
     }
 
-    /* ---------- 5. teardown ---------- */
+    // teardown
 
     {
         std::lock_guard<std::mutex> lock(clients_mutex);
         auto it = clients.find(username);
-        /* Only erase if the map still points at *this* session. */
+        // only erase if the map still points at this exact session
         if (it != clients.end() && it->second == sess)
             clients.erase(it);
     }
@@ -308,19 +294,17 @@ static void handle_client(int fd, std::string peer,
     std::cout << "[DISCONNECT] " << username << "\n";
     std::cout.flush();
 
-    /* sess goes out of scope here; the fd is closed by ~Session once no
-       relaying thread still holds a reference. */
+    // sess goes out of scope here; ~Session closes the fd once no
+    // relaying thread still holds a reference to it
 }
 
-/* ------------------------------------------------------------------ */
-/* main                                                                */
-/* ------------------------------------------------------------------ */
+// main
 
 int main(int argc, char *argv[])
 {
-    /* Phase 3: load the server certificate and its private key once, at
-       startup. Defaults to ./server-cert.pem and ./server-key.pem; override
-       as argv[1] and argv[2]. */
+    // load the server certificate and private key once at startup.
+    // Defaults to ./server-cert.pem and ./server-key.pem, override with
+    // argv[1] / argv[2]
     const char *cert_path = (argc > 1) ? argv[1] : "server-cert.pem";
     const char *key_path  = (argc > 2) ? argv[2] : "server-key.pem";
 
@@ -338,7 +322,7 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    /* Fail fast if the operator paired a mismatched cert and key. */
+    // fail fast if someone paired a mismatched cert and key
     if (!certs::key_matches_cert(cert, key, &cert_why)) {
         std::cerr << "Configuration error: " << cert_why << "\n";
         EVP_PKEY_free(key);
@@ -360,8 +344,8 @@ int main(int argc, char *argv[])
 
     sockaddr_in server_addr{};
     server_addr.sin_family      = AF_INET;
-    server_addr.sin_addr.s_addr = INADDR_ANY;   /* all interfaces: required
-                                                   for the multi-VM setup */
+    server_addr.sin_addr.s_addr = INADDR_ANY;   // all interfaces, needed
+                                                 // so other VMs can connect
     server_addr.sin_port        = htons(PORT);
 
     if (bind(server_fd, reinterpret_cast<sockaddr *>(&server_addr),

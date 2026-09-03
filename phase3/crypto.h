@@ -1,13 +1,5 @@
 /*
- * crypto.h -- CS6008 Phase 2: key derivation and the AES-256-GCM record layer
- *
- * Assignment constraints (§1.2, §3.1):
- *   - Only low-level primitives are used: <openssl/evp.h> for AES-GCM and
- *     SHA-256. No TLS/SSL, no DH/ECDH, no EVP_PKEY key agreement.
- *   - The raw DH shared secret is never used directly as a key; it is hashed
- *     (see derive_key).
- *   - Authenticated encryption: a record whose tag does not verify is never
- *     turned into plaintext, and the caller aborts the connection.
+ * crypto.h -- key derivation and the AES-256-GCM record layer
  */
 
 #ifndef CRYPTO_H
@@ -22,12 +14,12 @@ namespace crypto {
 
 constexpr size_t KEY_BYTES   = 32;   /* AES-256                       */
 constexpr size_t TAG_BYTES   = 16;   /* GCM tag                       */
-constexpr size_t NONCE_BYTES = 12;   /* 96-bit GCM nonce (the native  */
-                                     /* size; anything else forces an */
-                                     /* extra GHASH step)             */
+constexpr size_t NONCE_BYTES = 12;   /* 96-bit GCM nonce -- this is GCM's
+                                        native size; any other length
+                                        forces an extra GHASH step */
 
-/* Largest application message we will send or accept. Matches the 4096-byte
-   line cap the Phase 1 code already enforced. */
+/* Largest application message we'll send or accept -- matches the
+   4096-byte line cap from the plaintext chat version. */
 constexpr size_t MAX_PLAINTEXT = 4096;
 
 /* Record on the wire:
@@ -54,26 +46,21 @@ enum class RecvResult {
     ProtocolError   /* malformed framing, bad length, counter mismatch */
 };
 
-/* --------------------------------------------------------------- */
-/* Key derivation                                                   */
-/* --------------------------------------------------------------- */
+// key derivation
 
 /*
  * key = SHA-256( "CS6008-P2-KEY-v1" || Z )
  *
  * Z is the raw DH shared secret, serialised to a fixed 256 bytes.
  *
- * Why hash at all (assignment §3.1): Z is a uniformly-random-looking but not
- * uniform element of a subgroup of Z*_p. It is 2048 bits when we need 256,
- * it is not uniformly distributed over its range, and it carries algebraic
- * structure -- partial information about Z relates back to g^ab. SHA-256
- * acts as a randomness extractor: it compresses to exactly the key length,
- * destroys the algebraic relationship to g, and yields something
- * computationally indistinguishable from a uniform 256-bit string.
+ * Why hash instead of using Z directly: Z is an element of a subgroup of
+ * Z*_p, not a uniformly random 256-bit string, and it carries algebraic
+ * structure tied back to g^ab. SHA-256 compresses it to the right size and
+ * destroys that structure, giving something that looks like a random key.
  *
- * The label provides domain separation, so a different label over the same Z
- * yields an unrelated value -- which is how the fingerprint below is made
- * safe, and how Phase 4/5 will derive further keys from one exchange.
+ * The label gives domain separation -- a different label over the same Z
+ * gives an unrelated output, which is what makes the fingerprint below safe
+ * to print, and lets later phases derive other keys from the same exchange.
  */
 void derive_key(const unsigned char *shared, size_t shared_len,
                 unsigned char key_out[KEY_BYTES]);
@@ -82,15 +69,13 @@ void derive_key(const unsigned char *shared, size_t shared_len,
  * fingerprint = first 8 bytes of SHA-256( "CS6008-P2-FP-v1" || key ),
  * formatted as hex.
  *
- * Safe to print: the label differs from the KDF label, so this is a
- * one-way function of the key that reveals neither the key nor Z. Both
- * sides print it to demonstrate agreement (assignment §3.2).
+ * Safe to print: different label than the KDF, so it's a one-way function
+ * of the key that reveals neither the key nor Z. Both sides print it so we
+ * can visually confirm they agreed on the same key.
  */
 std::string fingerprint(const unsigned char key[KEY_BYTES]);
 
-/* --------------------------------------------------------------- */
-/* The encrypted record channel                                     */
-/* --------------------------------------------------------------- */
+// the encrypted record channel
 
 class SecureChannel {
 public:
@@ -101,28 +86,28 @@ public:
     SecureChannel &operator=(const SecureChannel &) = delete;
 
     /*
-     * Install the derived key. Role selects the direction tags used to build
-     * nonces, so the two directions never share a nonce even though they
-     * share a key:
+     * Installs the derived key. Role picks the direction tags used to build
+     * nonces, so both directions can share one key without ever sharing a
+     * nonce:
      *
      *   nonce = [4-byte direction tag][8-byte counter]   (96 bits total)
      *
-     * Client sends with tag 1 and receives on tag 2; the server is the
-     * mirror image. Counters start at 0 and increment once per record, so a
-     * (key, nonce) pair is never reused -- the one failure mode that would
-     * break GCM outright.
+     * Client sends on tag 1, receives on tag 2; server is the mirror image.
+     * Counters start at 0 and go up by one per record, so a (key, nonce)
+     * pair is never reused -- reusing one is the one thing that actually
+     * breaks GCM.
      */
     void init(const unsigned char key[KEY_BYTES], Role role);
 
-    /* Encrypt and send one application message. Thread-safe: the send
-       counter is protected by a mutex, because on the server one thread may
-       relay a message to a client while that client's own thread is sending
-       it a response. */
+    /* Encrypts and sends one message. Thread-safe -- the send counter is
+       behind a mutex because on the server, one thread might relay a
+       message to a client while that client's own thread also wants to
+       send something. */
     bool send_msg(int fd, const std::string &plaintext);
 
-    /* Receive, verify and decrypt one application message. Only called from
-       a single reader thread per connection, so the receive counter needs no
-       lock. Returns Ok / Closed / AuthFailure / ProtocolError. */
+    /* Receives, verifies and decrypts one message. Only ever called from
+       one reader thread per connection, so the receive counter doesn't need
+       a lock. */
     RecvResult recv_msg(int fd, std::string &plaintext_out);
 
 private:

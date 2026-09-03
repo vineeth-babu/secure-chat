@@ -1,22 +1,4 @@
-/*
- * client.cpp -- CS6008 Phase 2: chat client with DH + AES-256-GCM
- *
- * Command interface (assignment §1.3):
- *     @username message   send to username, and select username
- *     /chat username      select username without sending
- *     /who                list online users
- *     /quit               disconnect cleanly and exit
- *     anything else       sent as a plain chat message to the selected user
- *
- * Usage: ./client [connect-ip] [port] [ca-cert] [expected-server-ip]
- *   connect-ip           TCP destination (default 192.168.64.2)
- *   port                 TCP port (default 5000)
- *   ca-cert              trusted CA root PEM (default ca-cert.pem)
- *   expected-server-ip   identity to authenticate in the cert's IP SAN;
- *                        defaults to connect-ip. Set this separately only when
- *                        connecting through a proxy, to authenticate the REAL
- *                        server rather than the proxy's address.
- */
+
 
 #include "dh.h"
 #include "crypto.h"
@@ -39,9 +21,7 @@
 static const char *DEFAULT_SERVER_IP = "192.168.64.2";
 static const int   DEFAULT_PORT      = 5000;
 
-/* ------------------------------------------------------------------ */
-/* receiver thread                                                     */
-/* ------------------------------------------------------------------ */
+// receiver thread
 
 static void receive_messages(int socket_fd,
                              crypto::SecureChannel *ch,
@@ -77,7 +57,7 @@ static void receive_messages(int socket_fd,
             }
 
             running->store(false);
-            /* Unblock the main thread, which is sitting in getline(). */
+            // unblocks the main thread, which is sitting in getline()
             shutdown(socket_fd, SHUT_RDWR);
             break;
         }
@@ -103,23 +83,19 @@ static void receive_messages(int socket_fd,
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* main                                                                */
-/* ------------------------------------------------------------------ */
+// main
 
 int main(int argc, char *argv[])
 {
     const char *server_ip = (argc > 1) ? argv[1] : DEFAULT_SERVER_IP;
     const int   port      = (argc > 2) ? std::atoi(argv[2]) : DEFAULT_PORT;
-    /* Phase 3: trusted CA root. Defaults to ./ca-cert.pem; override as argv[3].
-       This is loaded from local disk and never from the network. */
+    // trusted CA root, defaults to ./ca-cert.pem, override with argv[3].
+    // Loaded from local disk, never from the network.
     const char *ca_path   = (argc > 3) ? argv[3] : "ca-cert.pem";
-    /* Phase 3: the server identity the client authenticates (the IP that must
-       appear in the certificate's IP SAN). This is DELIBERATELY separate from
-       the TCP destination: normally they are the same, but when connecting
-       through a proxy the client still authenticates the REAL server's
-       identity, not the proxy's address. Defaults to the connect IP, so
-       ordinary usage is unchanged; override as argv[4] for proxy testing. */
+    // the server identity we authenticate (must appear in the cert's IP
+    // SAN). Kept separate from the TCP destination on purpose: normally
+    // they're the same, but through a proxy we still want to authenticate
+    // the real server, not the proxy's address. Defaults to connect_ip.
     const char *expected_ip = (argc > 4) ? argv[4] : server_ip;
 
     std::string username;
@@ -130,7 +106,7 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    /* ---------- connect ---------- */
+    // connect
 
     int client_fd = socket(AF_INET, SOCK_STREAM, 0);
 
@@ -163,7 +139,7 @@ int main(int argc, char *argv[])
                   << " is a different host -- e.g. a proxy).\n";
     }
 
-    /* ---------- Phase 3: authenticate the server BEFORE any DH ---------- */
+    // authenticate the server before any DH
 
     std::string auth_why;
 
@@ -179,8 +155,8 @@ int main(int argc, char *argv[])
     std::cout.flush();
 
     if (!certs::client_verify_auth(client_fd, ca_store, expected_ip, &auth_why)) {
-        /* §4.1: on ANY validation failure the client aborts immediately and
-           does not proceed to DH or reveal a username. */
+        // on ANY validation failure we abort right away -- no DH, no
+        // username sent
         std::cerr << "[AUTH] server authentication FAILED: " << auth_why
                   << "\n[AUTH] Aborting before DH. No data was sent.\n";
         X509_STORE_free(ca_store);
@@ -193,7 +169,7 @@ int main(int argc, char *argv[])
                  "proven.\n";
     std::cout.flush();
 
-    /* ---------- Diffie-Hellman ---------- */
+    // Diffie-Hellman
 
     std::cout << "Performing Diffie-Hellman key exchange "
                  "(RFC 3526 group 14, 2048-bit)...\n";
@@ -213,7 +189,7 @@ int main(int argc, char *argv[])
     crypto::derive_key(shared, sizeof(shared), key);
     OPENSSL_cleanse(shared, sizeof(shared));    /* raw secret, done with it */
 
-    /* Fingerprint only: never the private exponent, raw secret or key. */
+    // fingerprint only -- never the private exponent, raw secret or key
     std::cout << "Key established. Fingerprint: "
               << crypto::fingerprint(key) << "\n"
               << "(this must match the fingerprint printed by the server "
@@ -223,7 +199,7 @@ int main(int argc, char *argv[])
     ch.init(key, crypto::Role::Client);
     OPENSSL_cleanse(key, sizeof(key));
 
-    /* ---------- registration (encrypted) ---------- */
+    // registration (encrypted)
 
     if (!ch.send_msg(client_fd, "REGISTER|" + username)) {
         std::cerr << "Failed to send registration\n";
@@ -246,12 +222,12 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    /* ---------- chat ---------- */
+    // chat
 
     std::atomic<bool> running(true);
     std::thread receiver(receive_messages, client_fd, &ch, &running);
 
-    /* §1.3: the currently selected chat partner. */
+    // the currently selected chat partner
     std::string selected;
 
     std::cout << "Commands: @user msg | /chat user | /who | /quit\n";
@@ -272,7 +248,7 @@ int main(int argc, char *argv[])
         if (input.empty())
             continue;
 
-        /* /quit */
+        // /quit
         if (input == "/quit") {
             ch.send_msg(client_fd, "QUIT");
             running.store(false);
@@ -280,7 +256,7 @@ int main(int argc, char *argv[])
             break;
         }
 
-        /* /who */
+        // /who
         if (input == "/who") {
             if (!ch.send_msg(client_fd, "WHO")) {
                 std::cout << "Failed to send.\n";
@@ -289,11 +265,11 @@ int main(int argc, char *argv[])
             continue;
         }
 
-        /* /chat username -- switch partner without sending */
+        // /chat username -- switch partner without sending
         if (input.rfind("/chat ", 0) == 0) {
             std::string target = input.substr(6);
 
-            /* trim surrounding spaces */
+            // trim surrounding spaces
             while (!target.empty() && target.front() == ' ')
                 target.erase(target.begin());
             while (!target.empty() && target.back() == ' ')
@@ -309,7 +285,7 @@ int main(int argc, char *argv[])
             continue;
         }
 
-        /* @username message -- send and select */
+        // @username message -- send and select
         if (input[0] == '@') {
             size_t space = input.find(' ');
 
@@ -337,11 +313,8 @@ int main(int argc, char *argv[])
             continue;
         }
 
-        /*
-         * §1.3: "Any input that does not match one of the recognized command
-         * tags should be treated as a plain chat message to whichever user is
-         * currently selected."
-         */
+        // anything that isn't one of the recognised commands is just a
+        // plain chat message to whoever is currently selected
         if (selected.empty()) {
             std::cout << "No chat partner selected. "
                          "Use @username message or /chat username.\n";

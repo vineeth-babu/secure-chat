@@ -1,17 +1,5 @@
 /*
- * dh.h -- CS6008 Phase 2: Diffie-Hellman over RFC 3526 Group 14
- *
- * Production DH module, extracted from the tested standalone dh_test.cpp.
- *
- * Assignment constraints (§1.2):
- *   - <openssl/dh.h> is NOT included. No DH/ECDH API, no EVP_PKEY key
- *     agreement or derivation, no TLS/SSL anywhere in this module.
- *   - <openssl/bn.h> is used only as an arbitrary-precision integer library,
- *     <openssl/rand.h> only as a CSPRNG.
- *   - The modular exponentiation is our own (dh::my_mod_exp). OpenSSL's own
- *     modexp routine is not called anywhere in the production path; it
- *     survives only inside dh_test.cpp as a reference cross-check, so that
- *     "grep -l" for that symbol across the sources names dh_test.cpp alone.
+ * dh.h -- Diffie-Hellman over RFC 3526 Group 14
  */
 
 #ifndef DH_H
@@ -27,22 +15,17 @@ namespace dh {
 /* 2048-bit values are always serialised to exactly this many bytes. */
 constexpr size_t PUB_BYTES = 256;
 
-/* Private exponent size. RFC 3526 §8 rates group 14 at 110-160 bits of
+/* Private exponent size. RFC 3526 rates group 14 at 110-160 bits of
    security with a matching exponent size of 220-320 bits, so 320 covers the
-   upper estimate. A full 2048-bit exponent would cost 6x the work and buy
-   nothing, since the discrete log is no harder than the subgroup order. */
+   upper end. A full 2048-bit exponent would cost 6x the work for nothing,
+   since the discrete log is no harder than the subgroup order anyway. */
 constexpr int PRIV_EXP_BITS = 320;
 
-/* --------------------------------------------------------------- */
-/* Our own modular exponentiation: out = base^exp mod m             */
-/* Left-to-right square-and-multiply, built from BN_mod_mul only.   */
-/* --------------------------------------------------------------- */
+// modular exponentiation: out = base^exp mod m
 bool my_mod_exp(BIGNUM *out, const BIGNUM *base, const BIGNUM *exp,
                 const BIGNUM *m, BN_CTX *ctx);
 
-/* --------------------------------------------------------------- */
-/* Group parameters: p, g, and q = (p-1)/2                          */
-/* --------------------------------------------------------------- */
+// group parameters: p, g, and q = (p-1)/2
 class Group {
 public:
     Group();
@@ -57,8 +40,8 @@ public:
     const BIGNUM *g() const { return g_; }
     const BIGNUM *q() const { return q_; }
 
-    /* Confirm p is prime and (p-1)/2 is prime. Slow (about a second), so it
-       is NOT called on the connection path -- only by dh_test. */
+    /* Confirms p is prime and (p-1)/2 is prime too. Slow (about a second),
+       so it's only called from dh_test, never on the connection path. */
     bool verify_safe_prime(BN_CTX *ctx) const;
 
 private:
@@ -68,9 +51,7 @@ private:
     bool ok_;
 };
 
-/* --------------------------------------------------------------- */
-/* Validation of a public value received from the network           */
-/* --------------------------------------------------------------- */
+// validating a public value that arrived over the network
 
 /* 1 < y < p-1. Rejects 0, 1 and p-1, which force the shared secret to a
    known value or to one guessable bit. */
@@ -81,9 +62,7 @@ bool in_range(const BIGNUM *y, const Group &grp);
    per handshake. Costs one full-size exponentiation via my_mod_exp. */
 bool in_subgroup(const BIGNUM *y, const Group &grp, BN_CTX *ctx);
 
-/* --------------------------------------------------------------- */
-/* One side of one exchange. Owns the private exponent and wipes it. */
-/* --------------------------------------------------------------- */
+// one side of one exchange -- owns the private exponent and wipes it
 class KeyPair {
 public:
     explicit KeyPair(const Group &grp);
@@ -112,22 +91,20 @@ private:
     BIGNUM *pub_;
 };
 
-/* --------------------------------------------------------------- */
-/* The exchange itself, over an already-connected socket            */
-/* --------------------------------------------------------------- */
+// the exchange itself, over an already-connected socket
 
 /*
- * Perform one complete DH exchange on fd and return the raw shared secret,
+ * Runs one complete DH exchange on fd and returns the raw shared secret,
  * serialised to a fixed PUB_BYTES bytes.
  *
  * Symmetric: both sides send their own public value first, then read the
- * peer's. 256 bytes fits comfortably in the socket buffers, so there is no
+ * peer's. 256 bytes fits easily in the socket buffers so there's no
  * deadlock, and it saves a round trip.
  *
- * Wire format:  [4-byte big-endian length = 256][256 bytes big-endian value]
+ * Wire format: [4-byte big-endian length = 256][256-byte value]
  *
- * The caller MUST hash the result before using it as a key, and MUST wipe it
- * (OPENSSL_cleanse) once the key has been derived.
+ * The caller must hash the result before using it as a key, and must wipe
+ * it (OPENSSL_cleanse) once the key is derived.
  */
 bool run_handshake(int fd, unsigned char shared_out[PUB_BYTES],
                    std::string *why);
