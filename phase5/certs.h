@@ -1,23 +1,20 @@
 /*
- * certs.h -- CS6008 Phase 3: server authentication via PKI
+ * certs.h -- server authentication via PKI (Phase 3)
  *
- * Adds, BEFORE the untouched Phase 2 DH exchange:
- *   1. the server sends its X.509 certificate (DER);
- *   2. the client validates it against a locally trusted CA root
- *      (signature chain, validity period, expected IP identity);
- *   3. the server proves possession of the matching private key by signing
- *      a fresh 32-byte random challenge the client generates.
- * Any failure aborts the connection before a single DH byte is sent.
+ * Runs BEFORE the Diffie-Hellman exchange:
+ *   1. server sends its X.509 certificate (DER)
+ *   2. client validates it against a locally trusted CA root (signature
+ *      chain, validity period, expected IP identity)
+ *   3. server proves it holds the matching private key by signing a fresh
+ *      32-byte random challenge from the client
+ * Any failure aborts the connection before a single DH byte goes out.
  *
- * Allowed-tools note (assignment §1.2): this module uses only the low-level
- * X.509 / EVP primitives that the assignment explicitly permits as building
- * blocks -- <openssl/x509.h>, <openssl/evp.h>, <openssl/pem.h>,
- * <openssl/rand.h>. It uses NO TLS/SSL (<openssl/ssl.h>) and NO DH/ECDH
- * exchange API. EVP_DigestSign / EVP_DigestVerify are digital-signature
- * primitives, not key agreement.
+ * Only low-level X.509/EVP primitives are used here -- x509.h, evp.h, pem.h,
+ * rand.h. No TLS/SSL, no DH/ECDH exchange API. EVP_DigestSign/Verify are
+ * plain digital-signature primitives, not key agreement.
  *
- * Wire framing reuses the Phase 2 convention: [4-byte big-endian length]
- * followed by that many bytes, carried by net::write_all / net::read_exact.
+ * Wire framing is the same [4-byte big-endian length] + payload convention
+ * used elsewhere, via net::write_all / net::read_exact.
  */
 
 #ifndef CERTS_H
@@ -46,8 +43,8 @@ constexpr size_t MAX_SIG_BYTES  = 1024;   /* RSA-2048 sig = 256 B          */
 X509     *load_cert_file(const char *path, std::string *why);
 EVP_PKEY *load_privkey_file(const char *path, std::string *why);
 
-/* Confirm the private key matches the certificate's public key. A mismatch
-   at startup is a deployment error worth catching before accepting clients. */
+/* Confirm the private key matches the certificate's public key -- catches a
+   mismatched cert/key pair at startup instead of failing weirdly later. */
 bool key_matches_cert(X509 *cert, EVP_PKEY *key, std::string *why);
 
 /* -------------------- client-side loading (startup) -------------------- */
@@ -60,25 +57,21 @@ X509_STORE *load_ca_store(const char *ca_path, std::string *why);
 /* -------------------- the authentication exchange ---------------------- */
 
 /*
- * Server side. Runs on the connection socket BEFORE dh::run_handshake:
- *   - send our certificate (DER, length-framed);
- *   - read the client's 32-byte challenge;
- *   - sign it with our private key (EVP_DigestSign, SHA-256);
- *   - send the signature (length-framed).
- * Returns false (reason in *why) on any socket or crypto failure; the caller
- * then drops the connection without proceeding to DH.
+ * Server side, runs before dh::run_handshake: send our cert (DER,
+ * length-framed), read the client's 32-byte challenge, sign it
+ * (EVP_DigestSign, SHA-256) and send the signature back.
+ * Returns false with a reason in *why on any failure; caller drops the
+ * connection instead of moving on to DH.
  */
 bool server_send_auth(int fd, X509 *cert, EVP_PKEY *key, std::string *why);
 
 /*
- * Client side. Runs on the connection socket BEFORE dh::run_handshake:
- *   - receive the server certificate and validate it against ca_store
- *     (signature chain + validity period), then check the expected identity
- *     (expected_ip must appear as an IP SAN);
- *   - generate a fresh 32-byte challenge and send it;
- *   - receive the signature and verify it with the certificate's public key.
- * On ANY failure returns false with a reason in *why and guarantees nothing
- * further (no DH, no username) has been sent.
+ * Client side, runs before dh::run_handshake: receive the server cert and
+ * validate it against ca_store (signature chain, validity, and expected_ip
+ * as an IP SAN), send a fresh 32-byte challenge, then verify the returned
+ * signature with the cert's public key.
+ * On any failure returns false and guarantees nothing further was sent (no
+ * DH, no username).
  */
 bool client_verify_auth(int fd, X509_STORE *ca_store,
                         const char *expected_ip, std::string *why);

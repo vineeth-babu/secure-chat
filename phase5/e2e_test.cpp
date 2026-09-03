@@ -1,12 +1,10 @@
 /*
- * e2e_test.cpp -- CS6008 Phase 4, Checkpoint 1 test harness
- *
- * Tests the e2e module in isolation: Base64 round-trip, AES-256-GCM
- * round-trip, and rejection of tampered ciphertext, tampered tags, tampered
- * nonces, truncation and malformed Base64.
- *
- * Build:  make e2e_test
- * Run:    ./e2e_test        (exit status 0 = pass, 1 = fail)
+ * Unit tests for e2e module:
+ * - Base64 encoding/decoding and boundary cases
+ * - AES-256-GCM encryption/decryption
+ * - Tampering and corrupted payload rejection
+ * - DH handshake, glare resolution, and session re-keying
+ * - Automatic key rotation and in-flight message continuity
  */
 
 #include "e2e.h"
@@ -21,8 +19,7 @@
 
 static int g_pass = 1;
 
-/* A4: every RAND_bytes prerequisite must be checked. If the CSPRNG fails we
-   must fail the test rather than continue with uninitialised memory. */
+// Wrapper to check if random bytes generation succeeded
 static bool rnd(unsigned char *buf, size_t len)
 {
     return RAND_bytes(buf, static_cast<int>(len)) == 1;
@@ -35,7 +32,7 @@ static void check(const char *what, bool ok)
         g_pass = 0;
 }
 
-/* Flip one bit at a byte offset inside the decoded blob, then re-encode. */
+// Helper to flip one bit at target offset and re-encode to test tampering
 static std::string tamper_at(const std::string &b64, size_t offset)
 {
     std::vector<unsigned char> blob;
@@ -45,15 +42,12 @@ static std::string tamper_at(const std::string &b64, size_t offset)
     return e2e::base64_encode(blob.data(), blob.size());
 }
 
-/* ------------------------------------------------------------------ */
-/* 1. Base64                                                           */
-/* ------------------------------------------------------------------ */
-
+// 1. Base64 tests
 static void test_base64()
 {
     std::printf("\n[1] Base64\n");
 
-    /* Known vectors (RFC 4648 test vectors). */
+    // Standard RFC 4648 test vectors
     struct { const char *in; const char *out; } vec[] = {
         { "",       ""         },
         { "f",      "Zg=="     },
@@ -76,8 +70,7 @@ static void test_base64()
     }
     check("RFC 4648 known-answer vectors", vectors_ok);
 
-    /* Round-trip every length 0..256 of random bytes: catches all three
-       tail cases (0, 1, 2 leftover bytes) many times over. */
+    // Test round trip across lengths 0 to 256
     bool roundtrip_ok = true;
     for (size_t len = 0; len <= 256 && roundtrip_ok; len++) {
         std::vector<unsigned char> data(len ? len : 1);
@@ -94,8 +87,7 @@ static void test_base64()
     }
     check("round-trip for every length 0..256 of random bytes", roundtrip_ok);
 
-    /* The alphabet must never contain characters that would break the
-       "MSG|recipient|payload" split or the outer framing. */
+    // Verify output has no characters that clash with message delimiters
     std::vector<unsigned char> big(512);
     if (!rnd(big.data(), big.size())) {
         check("RNG available for the Base64 safety vector", false);
@@ -108,7 +100,7 @@ static void test_base64()
                 enc.find('\r') == std::string::npos;
     check("encoded output contains no '|', space, CR or LF", safe);
 
-    /* Strict rejection of malformed input. */
+    // Invalid formatting checks
     std::vector<unsigned char> junk;
     check("rejects bad length (not a multiple of 4)",
           !e2e::base64_decode("Zm9vY", junk));
@@ -123,16 +115,7 @@ static void test_base64()
     check("rejects over-padding '===='",
           !e2e::base64_decode("====", junk));
 
-    /* ---- A1: canonical zero unused padding bits (RFC 4648 3.5) ----
-       A non-canonical encoding decodes to the SAME bytes as the canonical
-       one. Accepting it would make the transported text malleable: an
-       attacker could alter the Base64 without changing the decoded blob,
-       so the GCM tag would still verify. */
-
-    /* Two '=' : only one byte is encoded, so the low 4 bits of the 2nd
-       sextet are unused and must be zero.
-       'Z'=25, 'g'=32 -> 32 & 0x0F == 0  -> canonical.
-       'h'=33, 'i'=34, 'j'=35 all have non-zero low nibble -> must reject. */
+    // Ensure unused padding bits are strictly zero (canonical Base64)
     std::vector<unsigned char> d;
     check("canonical one-byte 'Zg==' decodes",
           e2e::base64_decode("Zg==", d) && d.size() == 1 && d[0] == 'f');
@@ -143,9 +126,6 @@ static void test_base64()
     check("rejects non-canonical 'Zj==' (unused 4 bits set)",
           !e2e::base64_decode("Zj==", d));
 
-    /* One '=' : two bytes encoded, low 2 bits of the 3rd sextet unused.
-       'Zm8=' : '8'=60, 60 & 0x03 == 0 -> canonical.
-       '9'=61, '+'=62, '/'=63 -> non-zero low 2 bits -> must reject. */
     check("canonical two-byte 'Zm8=' decodes",
           e2e::base64_decode("Zm8=", d) && d.size() == 2 &&
           d[0] == 'f' && d[1] == 'o');
@@ -156,16 +136,11 @@ static void test_base64()
     check("rejects non-canonical 'Zm/=' (unused 2 bits set)",
           !e2e::base64_decode("Zm/=", d));
 
-    /* A6: empty string is valid Base64 for zero bytes -- but is NOT a valid
-       E2E payload (no room for nonce+tag). The open() side is tested in [3]. */
     check("empty string is valid Base64 decoding to zero bytes",
           e2e::base64_decode("", d) && d.empty());
 }
 
-/* ------------------------------------------------------------------ */
-/* 2. AES-256-GCM round trip                                           */
-/* ------------------------------------------------------------------ */
-
+// 2. AES-256-GCM tests
 static void test_seal_open()
 {
     std::printf("\n[2] AES-256-GCM seal / open\n");
@@ -196,7 +171,7 @@ static void test_seal_open()
     check("round-trip of assorted messages (incl. empty, pipes, UTF-8)",
           all_ok);
 
-    /* Maximum-size payload must work; one byte over must be refused. */
+    // Check boundary limits on plaintext size
     std::string max_msg(e2e::MAX_E2E_PLAINTEXT, 'A');
     std::string b64, back;
     check("seals a full 2048-byte plaintext",
@@ -208,7 +183,7 @@ static void test_seal_open()
     check("refuses a plaintext over the 2048-byte cap",
           !e2e::seal(key, over, dummy));
 
-    /* Size budget: the wrapped form must fit the outer 4096-byte limit. */
+    // Ensure total formatted packet fits within outer max buffer
     std::string wrapped = "MSG|Bob|__E2E_MSG__" + b64;
     std::printf("      2048-byte plaintext -> %zu b64 chars; wrapped "
                 "\"MSG|Bob|__E2E_MSG__...\" = %zu bytes (outer cap 4096)\n",
@@ -216,7 +191,7 @@ static void test_seal_open()
     check("wrapped maximum message fits inside crypto::MAX_PLAINTEXT (4096)",
           wrapped.size() <= 4096);
 
-    /* Fresh nonce every call: same key + same plaintext must not repeat. */
+    // Verify nonces are randomized for every message
     std::string c1, c2;
     e2e::seal(key, "identical plaintext", c1);
     e2e::seal(key, "identical plaintext", c2);
@@ -224,10 +199,7 @@ static void test_seal_open()
           c1 != c2);
 }
 
-/* ------------------------------------------------------------------ */
-/* 3. tamper rejection                                                 */
-/* ------------------------------------------------------------------ */
-
+// 3. Tampering and corrupted payload checks
 static void test_tamper()
 {
     std::printf("\n[3] Tamper and forgery rejection\n");
@@ -247,7 +219,7 @@ static void test_tamper()
 
     std::string out;
 
-    /* blob layout: [0..11] nonce, [12..] ciphertext, last 16 bytes tag */
+    // Check bit flips in ciphertext, nonce, and tag
     check("rejects a flipped bit in the CIPHERTEXT",
           !e2e::open(key, tamper_at(b64, e2e::NONCE_BYTES), out));
 
@@ -259,16 +231,15 @@ static void test_tamper()
     check("rejects a flipped bit in the GCM TAG",
           !e2e::open(key, tamper_at(b64, blob.size() - 1), out));
 
-    /* Truncation. */
+    // Payload truncation and size checks
     std::string trunc = e2e::base64_encode(blob.data(), blob.size() - 4);
     check("rejects a truncated payload", !e2e::open(key, trunc, out));
 
-    /* Too short to hold a nonce + tag at all. */
     unsigned char tiny[4] = {1, 2, 3, 4};
     check("rejects a payload shorter than nonce+tag",
           !e2e::open(key, e2e::base64_encode(tiny, sizeof(tiny)), out));
 
-    /* Wrong key. */
+    // Wrong decryption key
     unsigned char other[e2e::KEY_BYTES];
     if (!rnd(other, sizeof(other))) {
         check("RNG available to generate the wrong key", false);
@@ -277,22 +248,18 @@ static void test_tamper()
     check("rejects decryption under the WRONG key",
           !e2e::open(other, b64, out));
 
-    /* Malformed Base64 reaches open() and must be refused before crypto. */
     check("rejects malformed Base64 input",
           !e2e::open(key, "not!valid!base64", out));
     check("rejects empty input", !e2e::open(key, "", out));
 
-    /* After every rejection, no plaintext may have been produced. */
     check("no plaintext leaked by any rejected input", out.empty());
 
-    /* And the untampered original still works, proving the tests above
-       failed for the right reason. */
+    // Sanity check valid payload still decrypts
     std::string good;
     check("the untampered original still decrypts correctly",
           e2e::open(key, b64, good) && good == msg);
 
-    /* ---- A3: explicit failure-output contracts ---- */
-
+    // Verify output parameters on failure
     std::string sentinel = "sentinel";
     std::string over(e2e::MAX_E2E_PLAINTEXT + 1, 'A');
     bool seal_failed = !e2e::seal(key, over, sentinel);
@@ -310,14 +277,13 @@ static void test_tamper()
           !e2e::open(key, tamper_at(b64, blob.size() - 1), sent3));
     check("open() CLEARS out_plaintext after tag failure", sent3.empty());
 
-    /* ---- A6: empty string is valid Base64 but not a valid E2E payload ---- */
     std::string sent4 = "sentinel";
     check("open() rejects \"\" (valid Base64, but no nonce/tag)",
           !e2e::open(key, "", sent4));
     check("open() cleared out_plaintext for the empty-input case",
           sent4.empty());
 
-    /* ---- A5: receive-side size guard, independent of seal()'s cap ---- */
+    // Test payload larger than max plaintext limit on receiver
     std::vector<unsigned char> oversized(
         e2e::NONCE_BYTES + (e2e::MAX_E2E_PLAINTEXT + 1) + e2e::TAG_BYTES);
     if (!rnd(oversized.data(), oversized.size())) {
@@ -334,18 +300,15 @@ static void test_tamper()
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* 4. Checkpoint 2: offline C1<->C2 DH session establishment           */
-/* ------------------------------------------------------------------ */
-
+// 4. Offline client-to-client DH handshake
 static void test_handshake()
 {
     std::printf("\n[4] E2E handshake (offline, no sockets, no server)\n");
 
-    e2e::E2EManager alice("alice");   /* two independent managers */
+    e2e::E2EManager alice("alice");
     e2e::E2EManager bob("bob");
 
-    /* ---- Alice -> INIT ---- */
+    // Alice -> INIT
     std::string init;
     check("alice.start(\"bob\") succeeds",
           alice.start("bob", init) == e2e::Result::Ok);
@@ -359,7 +322,7 @@ static void test_handshake()
           e2e::base64_decode(init.substr(std::strlen(e2e::TAG_INIT)), initpub)
           && initpub.size() == 256);
 
-    /* ---- Bob handles INIT -> ACK ---- */
+    // Bob handles INIT -> ACK
     std::string ack;
     check("bob.handle_init succeeds",
           bob.handle_init("alice", init, ack) == e2e::Result::Ok);
@@ -373,13 +336,13 @@ static void test_handshake()
           e2e::base64_decode(ack.substr(std::strlen(e2e::TAG_ACK)), ackpub)
           && ackpub.size() == e2e::BIND_BYTES + 256);
 
-    /* ---- Alice handles ACK ---- */
+    // Alice handles ACK
     check("alice.handle_ack succeeds",
           alice.handle_ack("bob", ack) == e2e::Result::Ok);
     check("alice is Established after handling ACK",
           alice.state_of("bob") == e2e::State::Established);
 
-    /* ---- both derived the same key, independently ---- */
+    // Verify matching derived keys and fingerprints
     unsigned char ka[e2e::KEY_BYTES], kb[e2e::KEY_BYTES];
     bool got = alice.get_key("bob", ka) && bob.get_key("alice", kb);
     check("both sides expose an established key", got);
@@ -393,13 +356,13 @@ static void test_handshake()
     std::printf("      alice fp: %s\n      bob   fp: %s\n",
                 fa.c_str(), fb.c_str());
 
-    /* ---- the key itself is never on the wire ---- */
+    // Verify key bytes do not leak into the wire payload
     std::string kb64 = e2e::base64_encode(ka, e2e::KEY_BYTES);
     check("the derived key does not appear inside INIT",
           init.find(kb64) == std::string::npos);
     check("the derived key does not appear inside ACK",
           ack.find(kb64) == std::string::npos);
-    /* Also check the raw key bytes are not embedded in the decoded payloads. */
+
     bool leaked = false;
     for (auto *v : { &initpub, &ackpub }) {
         if (v->size() >= e2e::KEY_BYTES) {
@@ -411,7 +374,7 @@ static void test_handshake()
     check("raw key bytes do not appear in the decoded INIT/ACK payloads",
           !leaked);
 
-    /* ---- the Checkpoint 2 key works with the Checkpoint 1 AEAD ---- */
+    // Test message encrypt/decrypt with derived key
     const std::string secret = "hello Bob -- this is end to end";
     std::string ct, back;
     check("alice seals with the DH-derived key",
@@ -424,10 +387,7 @@ static void test_handshake()
     OPENSSL_cleanse(kb, sizeof(kb));
 }
 
-/* ------------------------------------------------------------------ */
-/* 5. Checkpoint 2: rejection of malformed / out-of-state control       */
-/* ------------------------------------------------------------------ */
-
+// 5. Handshake error handling and rejection tests
 static void test_handshake_rejects()
 {
     std::printf("\n[5] Handshake rejection and session-safety rules\n");
@@ -435,7 +395,7 @@ static void test_handshake_rejects()
     e2e::E2EManager m("self");
     std::string out;
 
-    /* malformed INIT */
+    // Badly formatted INIT
     check("rejects INIT with no tag",
           m.handle_init("bob", "garbage", out) == e2e::Result::BadFormat);
     check("rejects INIT with the WRONG tag",
@@ -445,7 +405,7 @@ static void test_handshake_rejects()
           m.handle_init("bob", std::string(e2e::TAG_INIT) + "not!b64", out)
               == e2e::Result::BadFormat);
 
-    /* wrong decoded length */
+    // Invalid length of public key
     std::vector<unsigned char> shortpub(100, 0x42);
     check("rejects INIT whose payload is not 256 bytes",
           m.handle_init("bob",
@@ -453,8 +413,7 @@ static void test_handshake_rejects()
               e2e::base64_encode(shortpub.data(), shortpub.size()), out)
               == e2e::Result::BadFormat);
 
-    /* invalid DH public value: 256 bytes of zero is out of range and must be
-       rejected by the EXISTING dh validation inside compute_shared. */
+    // Invalid all-zero DH public value
     std::vector<unsigned char> zeropub(256, 0x00);
     check("rejects INIT with an invalid DH public value (all zero)",
           m.handle_init("bob",
@@ -464,10 +423,8 @@ static void test_handshake_rejects()
     check("no session was created by any rejected INIT",
           m.state_of("bob") == e2e::State::None);
 
-    /* ACK with no pending INIT */
+    // ACK without an in-flight INIT
     e2e::E2EManager m2("self");
-    /* Correctly SIZED ack (bind || pub) so it passes parsing and actually
-       reaches the no-pending-handshake check. */
     std::vector<unsigned char> okpub(e2e::BIND_BYTES + 256, 0x02);
     check("rejects ACK with no pending INIT (BadState)",
           m2.handle_ack("bob",
@@ -483,7 +440,7 @@ static void test_handshake_rejects()
               e2e::base64_encode(shortpub.data(), shortpub.size()))
               == e2e::Result::BadFormat);
 
-    /* ---- an invalid control message must NOT destroy a live session ---- */
+    // Invalid messages should not disrupt an existing session
     e2e::E2EManager a("alice"), b("bob");
     std::string init, ack;
     a.start("bob", init);
@@ -510,7 +467,7 @@ static void test_handshake_rejects()
               != e2e::Result::Ok &&
           b.state_of("alice") == e2e::State::Established);
 
-    /* ---- a valid fresh INIT may replace the session (documented) ---- */
+    // Starting a new valid session replaces the old one
     e2e::E2EManager c("alice");
     std::string init2, ack2;
     check("a second handshake can be started",
@@ -535,16 +492,12 @@ static void test_handshake_rejects()
     OPENSSL_cleanse(kb2, sizeof(kb2));
 }
 
-/* ------------------------------------------------------------------ */
-/* 6. Part A: simultaneous INIT (glare) must converge deterministically */
-/* ------------------------------------------------------------------ */
-
+// 6. Test deterministic resolution when both sides initiate at the same time
 static void test_glare()
 {
     std::printf("\n[6] Simultaneous INIT (glare) resolution\n");
 
-    /* Run the scenario both ways round so we cover winner-first and
-       loser-first delivery orders. */
+    // Test both arrival orders
     for (int order = 0; order < 2; order++) {
 
         e2e::E2EManager alice("alice");
@@ -552,7 +505,6 @@ static void test_glare()
 
         std::string ia, ib, ack_from_alice, ack_from_bob;
 
-        /* Both initiate at the same moment. */
         bool started = alice.start("bob", ia) == e2e::Result::Ok &&
                        bob.start("alice", ib) == e2e::Result::Ok;
         check("both peers start a handshake simultaneously", started);
@@ -568,19 +520,15 @@ static void test_glare()
             ra = alice.handle_init("bob", ib, ack_from_alice);
         }
 
-        /* "alice" < "bob", so alice wins and must ignore bob's INIT. */
+        // Lexicographically lower username ("alice" < "bob") wins tie-break
         check("winner (alice) IGNORES the peer INIT (GlareIgnored)",
               ra == e2e::Result::GlareIgnored);
         check("loser (bob) processes the INIT and produces an ACK",
               rb == e2e::Result::Ok);
 
-        /* Only a side that produced an ACK actually sends one. */
         if (rb == e2e::Result::Ok)
             check("winner completes on the loser's ACK",
                   alice.handle_ack("bob", ack_from_bob) == e2e::Result::Ok);
-
-        /* The loser's own INIT is answered by nobody. If a stray ACK were to
-           arrive it must not disturb the key -- exercised in [5]. */
 
         check("alice ends with a usable session",
               alice.is_established("bob"));
@@ -598,7 +546,6 @@ static void test_glare()
         check("no pending keypair is left behind on either side",
               !alice.has_pending("bob") && !bob.has_pending("alice"));
 
-        /* And the surviving key actually works with the AEAD. */
         std::string ct, back;
         check("the converged key encrypts/decrypts correctly",
               got && e2e::seal(ka, "glare survived", ct) &&
@@ -612,10 +559,7 @@ static void test_glare()
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* 7. Part B: old key stays usable during a replacement handshake      */
-/* ------------------------------------------------------------------ */
-
+// 7. Verify existing session remains active while a re-handshake is in flight
 static void test_replacement()
 {
     std::printf("\n[7] Replacement handshake keeps the old key usable\n");
@@ -623,7 +567,7 @@ static void test_replacement()
     e2e::E2EManager alice("alice");
     e2e::E2EManager bob("bob");
 
-    /* --- establish an initial session --- */
+    // Establish initial session
     std::string init, ack;
     bool ok = alice.start("bob", init) == e2e::Result::Ok &&
               bob.handle_init("alice", init, ack) == e2e::Result::Ok &&
@@ -640,7 +584,7 @@ static void test_replacement()
           e2e::seal(k_old, "before replacement", ct) &&
           e2e::open(k_old, ct, back) && back == "before replacement");
 
-    /* --- start a REPLACEMENT handshake --- */
+    // Start re-keying
     std::string init2, ack2;
     check("replacement handshake starts",
           alice.start("bob", init2) == e2e::Result::Ok);
@@ -651,6 +595,7 @@ static void test_replacement()
     check("is_established() still true while replacement pending",
           alice.is_established("bob"));
 
+    // Check old key is still valid while new handshake is incomplete
     unsigned char k_during[e2e::KEY_BYTES];
     check("the OLD key is still obtainable mid-replacement",
           alice.get_key("bob", k_during));
@@ -662,7 +607,7 @@ static void test_replacement()
           e2e::seal(k_during, "during replacement", ct2) &&
           e2e::open(k_old, ct2, back2) && back2 == "during replacement");
 
-    /* --- complete the replacement --- */
+    // Finish new handshake
     check("peer answers the replacement INIT",
           bob.handle_init("alice", init2, ack2) == e2e::Result::Ok);
     check("initiator completes the replacement",
@@ -676,13 +621,11 @@ static void test_replacement()
           both && CRYPTO_memcmp(k_new, k_old, e2e::KEY_BYTES) != 0);
     check("no pending handshake remains", !alice.has_pending("bob"));
 
-    /* --- a FAILED replacement must leave the working key intact --- */
+    // Failed replacement should not destroy existing key
     std::string init3;
     check("another replacement starts",
           alice.start("bob", init3) == e2e::Result::Ok);
 
-    /* A forged ACK (correct size, wrong binding) is now rejected at the
-       BINDING check, before any DH work. */
     std::vector<unsigned char> junkpub(e2e::BIND_BYTES + 256, 0x00);
     check("a forged ACK is rejected by the binding check",
           alice.handle_ack("bob",
@@ -695,8 +638,6 @@ static void test_replacement()
           alice.get_key("bob", k_after));
     check("and the key is UNCHANGED by the failure",
           CRYPTO_memcmp(k_new, k_after, e2e::KEY_BYTES) == 0);
-    /* Improved contract: a mismatched ACK no longer consumes the live
-       handshake, so the genuine ACK can still complete it. */
     check("the live pending handshake SURVIVES a forged ACK",
           alice.has_pending("bob"));
 
@@ -707,10 +648,7 @@ static void test_replacement()
     OPENSSL_cleanse(k_during, sizeof(k_during));
 }
 
-/* ------------------------------------------------------------------ */
-/* 8. Part A/B: stale (delayed) ACK from a superseded handshake        */
-/* ------------------------------------------------------------------ */
-
+// 8. Test rejection of delayed ACK belonging to a superseded handshake
 static void test_stale_ack()
 {
     std::printf("\n[8] Delayed/stale ACK binding\n");
@@ -718,7 +656,7 @@ static void test_stale_ack()
     e2e::E2EManager alice("alice");
     e2e::E2EManager bob("bob");
 
-    /* --- H1: Alice INIT(A1); Bob answers with ACK(B1) which we DELAY --- */
+    // First handshake (hold back ACK)
     std::string i1, ack1;
     bool h1 = alice.start("bob", i1) == e2e::Result::Ok &&
               bob.handle_init("alice", i1, ack1) == e2e::Result::Ok;
@@ -729,14 +667,14 @@ static void test_stale_ack()
     unsigned char k_bob_h1[e2e::KEY_BYTES];
     check("bob established a key from H1", bob.get_key("alice", k_bob_h1));
 
-    /* --- H2: Alice starts a replacement, superseding pending A1 --- */
+    // Second handshake initiated by Alice
     std::string i2, ack2;
     check("H2: alice starts a replacement handshake",
           alice.start("bob", i2) == e2e::Result::Ok);
     check("alice has a pending handshake (A2)", alice.has_pending("bob"));
     check("alice has NO usable key yet", !alice.is_established("bob"));
 
-    /* --- now deliver the delayed, cryptographically valid ACK(B1) --- */
+    // Deliver old ACK from first handshake
     e2e::Result stale = alice.handle_ack("bob", ack1);
 
     check("the STALE ACK is REJECTED", stale != e2e::Result::Ok);
@@ -745,7 +683,7 @@ static void test_stale_ack()
     check("stale ACK did NOT consume the live pending handshake",
           alice.has_pending("bob"));
 
-    /* --- the genuine H2 ACK must still complete --- */
+    // Deliver matching second ACK
     check("bob answers the H2 INIT",
           bob.handle_init("alice", i2, ack2) == e2e::Result::Ok);
     check("alice completes H2 with its own ACK",
@@ -771,10 +709,7 @@ static void test_stale_ack()
     OPENSSL_cleanse(k_bob_h1, sizeof(k_bob_h1));
 }
 
-/* ------------------------------------------------------------------ */
-/* 9. Part C/D: no stale control message may disturb a LIVE key        */
-/* ------------------------------------------------------------------ */
-
+// 9. Ensure replayed or stale messages cannot corrupt an established key
 static void test_stale_cannot_disturb_established()
 {
     std::printf("\n[9] Stale control messages vs an established key\n");
@@ -782,7 +717,7 @@ static void test_stale_cannot_disturb_established()
     e2e::E2EManager alice("alice");
     e2e::E2EManager bob("bob");
 
-    /* Establish a working session. */
+    // Baseline session
     std::string i1, a1;
     bool ok = alice.start("bob", i1) == e2e::Result::Ok &&
               bob.handle_init("alice", i1, a1) == e2e::Result::Ok &&
@@ -794,7 +729,7 @@ static void test_stale_cannot_disturb_established()
     unsigned char k0[e2e::KEY_BYTES];
     check("baseline key retrievable", alice.get_key("bob", k0));
 
-    /* Replay the SAME ACK now that nothing is pending. */
+    // Replay ACK with no handshake pending
     e2e::Result r = alice.handle_ack("bob", a1);
     unsigned char k1[e2e::KEY_BYTES];
     check("replayed ACK is rejected once established",
@@ -805,7 +740,7 @@ static void test_stale_cannot_disturb_established()
     check("state still Established", 
           alice.state_of("bob") == e2e::State::Established);
 
-    /* Start a replacement, then feed the OLD ack while H2 is pending. */
+    // Start new handshake, replay previous ACK
     std::string i2, a2;
     check("replacement handshake started",
           alice.start("bob", i2) == e2e::Result::Ok);
@@ -826,7 +761,7 @@ static void test_stale_cannot_disturb_established()
     check("the live pending handshake was NOT consumed",
           alice.has_pending("bob"));
 
-    /* And the real replacement still completes. */
+    // Complete real replacement
     check("peer answers the replacement",
           bob.handle_init("alice", i2, a2) == e2e::Result::Ok);
     check("replacement completes",
@@ -839,7 +774,7 @@ static void test_stale_cannot_disturb_established()
     check("replacement key differs from the baseline",
           both && CRYPTO_memcmp(knew, k0, e2e::KEY_BYTES) != 0);
 
-    /* Malformed ACK must also leave the key alone. */
+    // Corrupted ACK test
     check("malformed ACK rejected",
           alice.handle_ack("bob", std::string(e2e::TAG_ACK) + "!!!")
               != e2e::Result::Ok);
@@ -849,18 +784,13 @@ static void test_stale_cannot_disturb_established()
     check("KEY BYTES UNCHANGED by the malformed ACK",
           CRYPTO_memcmp(knew, kfin, e2e::KEY_BYTES) == 0);
 
-    OPENSSL_cleanse(k0, sizeof(k0));   OPENSSL_cleanse(k1, sizeof(k1));
+    OPENSSL_cleanse(k0, sizeof(k0));     OPENSSL_cleanse(k1, sizeof(k1));
     OPENSSL_cleanse(kmid, sizeof(kmid)); OPENSSL_cleanse(kafter, sizeof(kafter));
     OPENSSL_cleanse(knew, sizeof(knew)); OPENSSL_cleanse(kbob, sizeof(kbob));
     OPENSSL_cleanse(kfin, sizeof(kfin));
 }
 
-/* ------------------------------------------------------------------ */
-/* 10. Phase 5: periodic rekeying / forward secrecy                    */
-/* ------------------------------------------------------------------ */
-
-/* Drive one complete rotation between two managers. Returns false on any
-   protocol failure. */
+// Helper to run a full key exchange handshake between two managers
 static bool rotate(e2e::E2EManager &initiator, const char *init_peer,
                    e2e::E2EManager &responder, const char *resp_peer)
 {
@@ -870,14 +800,15 @@ static bool rotate(e2e::E2EManager &initiator, const char *init_peer,
            initiator.handle_ack(init_peer, ack) == e2e::Result::Ok;
 }
 
+// 10. Key rotation tests
 static void test_phase5_rotation()
 {
-    std::printf("\n[10] Phase 5: key rotation\n");
+    std::printf("\n[10] Key rotation\n");
 
     e2e::E2EManager alice("alice");
     e2e::E2EManager bob("bob");
 
-    /* --- initial establishment --- */
+    // Initial establishment
     check("initial E2E session established",
           rotate(alice, "bob", bob, "alice"));
 
@@ -889,7 +820,7 @@ static void test_phase5_rotation()
           alice.rotation_count_of("bob") == 1 &&
           bob.rotation_count_of("alice") == 1);
 
-    /* --- rotation 1 --- */
+    // First rotation
     check("rotation 1 completes", rotate(alice, "bob", bob, "alice"));
 
     unsigned char k1a[e2e::KEY_BYTES], k1b[e2e::KEY_BYTES];
@@ -902,7 +833,7 @@ static void test_phase5_rotation()
           alice.fingerprint_of("bob") == bob.fingerprint_of("alice"));
     check("rotation counter is 2", alice.rotation_count_of("bob") == 2);
 
-    /* --- rotation 2 --- */
+    // Second rotation
     check("rotation 2 completes", rotate(alice, "bob", bob, "alice"));
 
     unsigned char k2a[e2e::KEY_BYTES], k2b[e2e::KEY_BYTES];
@@ -915,7 +846,7 @@ static void test_phase5_rotation()
           CRYPTO_memcmp(k2a, k0a, e2e::KEY_BYTES) != 0);
     check("rotation counter is 3", alice.rotation_count_of("bob") == 3);
 
-    /* --- a message encrypted AFTER rotation decrypts (§6.2) --- */
+    // Message sent with new key decrypts properly
     std::string ct, pt;
     check("message sent immediately after rotation decrypts correctly",
           e2e::seal(k2a, "post-rotation message", ct) &&
@@ -926,13 +857,10 @@ static void test_phase5_rotation()
     OPENSSL_cleanse(k2a, sizeof(k2a)); OPENSSL_cleanse(k2b, sizeof(k2b));
 }
 
-/* ------------------------------------------------------------------ */
-/* 11. Phase 5: message continuity across a rotation                   */
-/* ------------------------------------------------------------------ */
-
+// 11. Message continuity during rotation window
 static void test_phase5_continuity()
 {
-    std::printf("\n[11] Phase 5: continuity via the transition key\n");
+    std::printf("\n[11] Message continuity via transition key\n");
 
     e2e::E2EManager alice("alice");
     e2e::E2EManager bob("bob");
@@ -943,7 +871,7 @@ static void test_phase5_continuity()
     unsigned char k_old[e2e::KEY_BYTES];
     check("old key retrievable", alice.get_key("bob", k_old));
 
-    /* Alice begins a rotation and keeps using the OLD key meanwhile. */
+    // Alice starts rotation while holding old key
     std::string init, ack;
     check("alice starts a rotation", alice.start("bob", init) == e2e::Result::Ok);
 
@@ -952,12 +880,12 @@ static void test_phase5_continuity()
           alice.get_key("bob", k_mid) &&
           CRYPTO_memcmp(k_old, k_mid, e2e::KEY_BYTES) == 0);
 
-    /* A chat message sealed under the OLD key, still in flight. */
+    // In-flight message encrypted with pre-rotation key
     std::string inflight;
     check("alice seals a message under the old key",
           e2e::seal(k_mid, "in flight during rotation", inflight));
 
-    /* Bob processes the INIT and rotates BEFORE that message reaches him. */
+    // Bob rotates to new key before in-flight message reaches him
     check("bob rotates on the INIT",
           bob.handle_init("alice", init, ack) == e2e::Result::Ok);
 
@@ -965,14 +893,13 @@ static void test_phase5_continuity()
     check("bob is now on a NEW key", bob.get_key("alice", k_bob_new) &&
           CRYPTO_memcmp(k_bob_new, k_old, e2e::KEY_BYTES) != 0);
 
-    /* THE CASE PHASE 5 REQUIRES: the in-flight message must still be
-       readable, via the one-generation transition key. */
+    // In-flight message still decrypts using transition key
     std::string plain;
     check("IN-FLIGHT message still decrypts (transition key)",
           bob.open_for_peer("alice", inflight, plain) &&
           plain == "in flight during rotation");
 
-    /* Completing the rotation must not break anything. */
+    // Finalize rotation
     check("alice completes the rotation",
           alice.handle_ack("bob", ack) == e2e::Result::Ok);
 
@@ -986,10 +913,7 @@ static void test_phase5_continuity()
           e2e::seal(kna, "after", ct2) &&
           bob.open_for_peer("alice", ct2, pt2) && pt2 == "after");
 
-    /* --- only ONE generation is retained --- */
-    /* After a further rotation, a message under k_old (two generations back)
-       must NO LONGER decrypt: the transition key now holds the intermediate
-       key, not the original. */
+    // Old key beyond 1-generation transition window should be rejected
     check("a further rotation completes", rotate(alice, "bob", bob, "alice"));
 
     std::string stale_ct, stale_pt;
@@ -1006,13 +930,10 @@ static void test_phase5_continuity()
     OPENSSL_cleanse(knb, sizeof(knb));
 }
 
-/* ------------------------------------------------------------------ */
-/* 12. Phase 5: simultaneous rotation (glare) on an ESTABLISHED session */
-/* ------------------------------------------------------------------ */
-
+// 12. Simultaneous rotation collision handling
 static void test_phase5_simultaneous_rotation()
 {
-    std::printf("\n[12] Phase 5: simultaneous rotation collision\n");
+    std::printf("\n[12] Simultaneous rotation collision\n");
 
     for (int order = 0; order < 2; order++) {
 
@@ -1025,7 +946,7 @@ static void test_phase5_simultaneous_rotation()
         unsigned char k_before[e2e::KEY_BYTES];
         alice.get_key("bob", k_before);
 
-        /* BOTH timers fire at once on an already-established session. */
+        // Both peers initiate rotation at the same time
         std::string ia, ib, aa, ab;
         check("both peers start a rotation simultaneously",
               alice.start("bob", ia) == e2e::Result::Ok &&
@@ -1060,7 +981,6 @@ static void test_phase5_simultaneous_rotation()
         check("no pending handshake is left dangling",
               !alice.has_pending("bob") && !bob.has_pending("alice"));
 
-        /* Chat works under the converged key. */
         std::string ct, pt;
         check("chat works after simultaneous rotation",
               got && e2e::seal(ka, "after glare rotation", ct) &&
@@ -1072,12 +992,9 @@ static void test_phase5_simultaneous_rotation()
     }
 }
 
-/* ------------------------------------------------------------------ */
-
 int main()
 {
-    std::printf("e2e_test -- Phase 4 Checkpoints 1-2 "
-                "(Base64, AES-256-GCM, E2E DH handshake, glare, replacement)\n");
+    std::printf("Running E2E test harness...\n");
 
     test_base64();
     test_seal_open();

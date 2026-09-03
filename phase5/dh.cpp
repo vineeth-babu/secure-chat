@@ -1,24 +1,5 @@
 /*
- * dh.cpp -- CS6008 Phase 2: Diffie-Hellman over RFC 3526 Group 14
- *
- * NOTE FOR THE MARKER: this file uses BN_mod_exp ONLY as a generic
- * big-integer modular-exponentiation primitive -- the "base^exp mod m"
- * building block the assignment expects. It does NOT use any OpenSSL routine
- * that performs Diffie-Hellman itself: no <openssl/dh.h>, no DH_generate_key,
- * no DH_compute_key, no EVP_PKEY DH/ECDH derivation, no TLS/SSL.
- *
- * The Diffie-Hellman PROTOCOL is implemented here, in application code, which
- * explicitly and visibly controls each step:
- *     - private exponent generation      (KeyPair::generate, BN_priv_rand)
- *     - public value  A = g^a mod p       (KeyPair::generate)
- *     - exchange of public values         (run_handshake / dh_as_server)
- *     - shared secret Z = B^a mod p        (KeyPair::compute_shared)
- *     - peer-value validation             (in_range, in_subgroup)
- * BN_mod_exp only evaluates the modular exponentiation inside those steps.
- *
- * A single wrapper, mod_exp(), routes every exponentiation through
- * BN_mod_exp with the constant-time flag set, so the choice of primitive
- * lives in exactly one place.
+ * dh.cpp -- Diffie-Hellman over RFC 3526 Group 14
  */
 
 #include "dh.h"
@@ -34,11 +15,8 @@
 
 namespace dh {
 
-/* ------------------------------------------------------------------ */
-/* RFC 3526 section 3 -- 2048-bit MODP Group, id 14. Generator is 2.   */
-/* Six 32-bit words per line, exactly as printed in the RFC, so the    */
-/* constant can be diffed against the document by eye.                 */
-/* ------------------------------------------------------------------ */
+// RFC 3526 group 14 (2048-bit MODP), generator 2. Kept in the same
+// six-words-per-line layout as the RFC so it's easy to eyeball against it.
 
 static const char *MODP2048_HEX =
     "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1"
@@ -55,31 +33,22 @@ static const char *MODP2048_HEX =
 
 static const unsigned long MODP2048_G = 2;
 
-/* ------------------------------------------------------------------ */
-/* our own modular exponentiation                                      */
-/* ------------------------------------------------------------------ */
+// modular exponentiation
 
 /*
  * my_mod_exp: out = base^exp mod m.
  *
- * Per the TA clarification, the modular exponentiation is performed by
- * OpenSSL's generic big-integer primitive BN_mod_exp -- the "base^exp mod m"
- * operation the assignment expects us to build DH on top of. This is NOT a
- * Diffie-Hellman routine: it has no notion of a group, a key, or a peer. The
- * DH protocol around it (which value is the generator, which is secret, when
- * to exchange, how to validate) is implemented in this file's application
- * code, not by OpenSSL.
+ * Wraps BN_mod_exp, which is just the generic big-integer "base^exp mod m"
+ * operation -- it doesn't know about groups, keys or peers. All the actual
+ * DH logic (generator, secret, when to exchange, how to validate) lives in
+ * this file's application code, not in OpenSSL.
  *
- * The name and signature are kept unchanged so that the callers below,
- * dh.h, and the dh_test harness need no edits. Every exponentiation in the
- * module funnels through this one wrapper, so the primitive is chosen in
- * exactly one place.
+ * Every exponentiation in this module goes through this one function, so
+ * the underlying primitive only needs to be chosen once, here.
  *
- * A temporary copy of the exponent carries BN_FLG_CONSTTIME, which makes
- * BN_mod_exp take its constant-time (Montgomery-ladder) path. This removes
- * the exponent-dependent timing that the previous hand-written
- * square-and-multiply had, so the earlier "timing leak" caveat no longer
- * applies.
+ * A temporary copy of the exponent gets BN_FLG_CONSTTIME set, so BN_mod_exp
+ * takes its constant-time path and the running time doesn't leak anything
+ * about the exponent.
  */
 bool my_mod_exp(BIGNUM *out, const BIGNUM *base, const BIGNUM *exp,
                 const BIGNUM *m, BN_CTX *ctx)
@@ -98,9 +67,7 @@ bool my_mod_exp(BIGNUM *out, const BIGNUM *base, const BIGNUM *exp,
     return rc == 1;
 }
 
-/* ------------------------------------------------------------------ */
-/* Group                                                               */
-/* ------------------------------------------------------------------ */
+// Group
 
 Group::Group() : p_(nullptr), g_(nullptr), q_(nullptr), ok_(false)
 {
@@ -109,9 +76,8 @@ Group::Group() : p_(nullptr), g_(nullptr), q_(nullptr), ok_(false)
     if (g_ == nullptr || q_ == nullptr)
         return;
 
-    /* BN_hex2bn returns the count of hex digits consumed. Anything short of
-       the whole string means the constant contains a stray character and has
-       been silently truncated. */
+    // BN_hex2bn returns how many hex digits it consumed -- anything short
+    // of the full string means the constant has a stray character somewhere
     int consumed = BN_hex2bn(&p_, MODP2048_HEX);
     if (p_ == nullptr ||
         consumed != static_cast<int>(std::strlen(MODP2048_HEX)))
@@ -123,8 +89,8 @@ Group::Group() : p_(nullptr), g_(nullptr), q_(nullptr), ok_(false)
     if (!BN_set_word(g_, MODP2048_G))
         return;
 
-    /* q = (p - 1) / 2. p is a safe prime, so g = 2 generates the subgroup
-       of order q rather than the whole group. */
+    // q = (p - 1) / 2. p is a safe prime, so g = 2 generates the subgroup
+    // of order q instead of the whole group
     if (!BN_copy(q_, p_) || !BN_sub_word(q_, 1) || !BN_rshift1(q_, q_))
         return;
 
@@ -143,7 +109,7 @@ bool Group::verify_safe_prime(BN_CTX *ctx) const
     if (!ok_)
         return false;
 
-    /* BN_check_prime is OpenSSL 3.0+. On 1.1.1 use BN_is_prime_ex. */
+    // BN_check_prime needs OpenSSL 3.0+; use BN_is_prime_ex on 1.1.1
     if (BN_check_prime(p_, ctx, nullptr) != 1)
         return false;
     if (BN_check_prime(q_, ctx, nullptr) != 1)
@@ -152,9 +118,7 @@ bool Group::verify_safe_prime(BN_CTX *ctx) const
     return true;
 }
 
-/* ------------------------------------------------------------------ */
-/* validation of network-controlled values                             */
-/* ------------------------------------------------------------------ */
+// validating a value that came from the network
 
 bool in_range(const BIGNUM *y, const Group &grp)
 {
@@ -165,7 +129,7 @@ bool in_range(const BIGNUM *y, const Group &grp)
     bool ok = false;
 
     if (BN_copy(pm1, grp.p()) && BN_sub_word(pm1, 1)) {
-        /* y > 1 and y < p-1 */
+        // y > 1 and y < p-1
         ok = (BN_cmp(y, BN_value_one()) > 0) && (BN_cmp(y, pm1) < 0);
     }
 
@@ -188,9 +152,7 @@ bool in_subgroup(const BIGNUM *y, const Group &grp, BN_CTX *ctx)
     return ok;
 }
 
-/* ------------------------------------------------------------------ */
-/* KeyPair                                                             */
-/* ------------------------------------------------------------------ */
+// KeyPair
 
 KeyPair::KeyPair(const Group &grp)
     : grp_(grp), priv_(BN_new()), pub_(BN_new())
@@ -199,7 +161,7 @@ KeyPair::KeyPair(const Group &grp)
 
 KeyPair::~KeyPair()
 {
-    BN_clear_free(priv_);   /* clear_free wipes the memory before freeing */
+    BN_clear_free(priv_);   // wipes the memory before freeing it
     BN_clear_free(pub_);
 }
 
@@ -211,10 +173,9 @@ bool KeyPair::generate(BN_CTX *ctx)
     if (RAND_status() != 1)
         return false;                       /* RNG not seeded */
 
-    /* BN_priv_rand draws from OpenSSL's *private* DRBG. It is an RNG, not a
-       DH routine, so it does not touch the "implement DH yourself"
-       requirement. BN_RAND_TOP_ONE forces the top bit so the exponent is
-       exactly PRIV_EXP_BITS long rather than occasionally shorter. */
+    // BN_priv_rand pulls from OpenSSL's private DRBG -- it's an RNG, not a
+    // DH routine. BN_RAND_TOP_ONE forces the top bit so the exponent is
+    // always exactly PRIV_EXP_BITS long instead of sometimes shorter
     if (!BN_priv_rand(priv_, PRIV_EXP_BITS,
                       BN_RAND_TOP_ONE, BN_RAND_BOTTOM_ANY))
         return false;
@@ -222,7 +183,7 @@ bool KeyPair::generate(BN_CTX *ctx)
     if (BN_num_bits(priv_) != PRIV_EXP_BITS)
         return false;
 
-    /* A = g^a mod p, using our own exponentiation */
+    // A = g^a mod p, using our own exponentiation
     return my_mod_exp(pub_, grp_.g(), priv_, grp_.p(), ctx);
 }
 
@@ -231,9 +192,9 @@ bool KeyPair::public_bytes(unsigned char out[PUB_BYTES]) const
     if (pub_ == nullptr)
         return false;
 
-    /* bn2binPAD, not bn2bin: a BIGNUM is a number, not a byte string, so
-       BN_bn2bin strips leading zeros and returns a short buffer roughly one
-       time in 256. Fixed width keeps both sides byte-identical. */
+    // bn2binPAD, not bn2bin: a BIGNUM is a number, not a byte string, so
+    // BN_bn2bin strips leading zeros and gives a short buffer about 1 time
+    // in 256. Fixed width keeps both sides byte-identical.
     return BN_bn2binpad(pub_, out, PUB_BYTES) == static_cast<int>(PUB_BYTES);
 }
 
@@ -252,7 +213,7 @@ bool KeyPair::compute_shared(const unsigned char peer[PUB_BYTES],
         goto done;
     }
 
-    /* ---- validate before use (assignment: network-controlled data) ---- */
+    // validate before use -- this value came from the network
 
     if (!in_range(y, grp_)) {
         if (why) *why = "peer public value out of range (must satisfy 1 < y < p-1)";
@@ -264,14 +225,15 @@ bool KeyPair::compute_shared(const unsigned char peer[PUB_BYTES],
         goto done;
     }
 
-    /* ---- Z = y^a mod p, using our own exponentiation ---- */
+    // Z = y^a mod p, using our own exponentiation
 
     if (!my_mod_exp(z, y, priv_, grp_.p(), ctx)) {
         if (why) *why = "modular exponentiation failed";
         goto done;
     }
 
-    /* Paranoia: a degenerate secret would mean validation was bypassed. */
+    // just in case -- a degenerate secret here would mean validation
+    // above was somehow bypassed
     if (BN_is_zero(z) || BN_is_one(z)) {
         if (why) *why = "degenerate shared secret";
         goto done;
@@ -286,13 +248,11 @@ bool KeyPair::compute_shared(const unsigned char peer[PUB_BYTES],
 
 done:
     BN_free(y);
-    BN_clear_free(z);       /* the secret: wipe before freeing */
+    BN_clear_free(z);       // this is the secret -- wipe before freeing
     return ok;
 }
 
-/* ------------------------------------------------------------------ */
-/* the exchange over a socket                                          */
-/* ------------------------------------------------------------------ */
+// the exchange over a socket
 
 bool run_handshake(int fd, unsigned char shared_out[PUB_BYTES],
                    std::string *why)
@@ -303,9 +263,8 @@ bool run_handshake(int fd, unsigned char shared_out[PUB_BYTES],
         return false;
     }
 
-    /* BN_CTX is NOT thread-safe. This one is local to the calling thread,
-       which is what makes per-connection handshakes safe to run in
-       parallel. */
+    // BN_CTX is not thread-safe -- keeping it local to this thread is what
+    // makes it safe to run one handshake per connection in parallel
     BN_CTX *ctx = BN_CTX_new();
     if (ctx == nullptr) {
         if (why) *why = "BN_CTX_new failed";
@@ -330,7 +289,7 @@ bool run_handshake(int fd, unsigned char shared_out[PUB_BYTES],
             goto done;
         }
 
-        /* ---- send ours: [4-byte BE length][256 bytes] ---- */
+        // send ours: [4-byte BE length][256 bytes]
 
         netlen = htonl(static_cast<uint32_t>(PUB_BYTES));
         if (!net::write_all(fd, &netlen, sizeof(netlen)) ||
@@ -339,7 +298,7 @@ bool run_handshake(int fd, unsigned char shared_out[PUB_BYTES],
             goto done;
         }
 
-        /* ---- read theirs, validating the length before using it ---- */
+        // read theirs, checking the length before we trust it
 
         if (!net::read_exact(fd, &netlen, sizeof(netlen))) {
             if (why) *why = "connection closed during DH exchange";
@@ -356,8 +315,8 @@ bool run_handshake(int fd, unsigned char shared_out[PUB_BYTES],
             goto done;
         }
 
-        /* Reflection check: a peer echoing our own value back would make
-           both sides "agree" on a secret the attacker also controls. */
+        // reflection check: a peer that just echoes our value back would
+        // make us "agree" on a secret an attacker also knows
         if (CRYPTO_memcmp(peer, mine, PUB_BYTES) == 0) {
             if (why) *why = "peer reflected our own public value";
             goto done;

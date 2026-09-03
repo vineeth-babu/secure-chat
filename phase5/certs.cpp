@@ -1,8 +1,7 @@
 /*
- * certs.cpp -- CS6008 Phase 3: server authentication via PKI
+ * certs.cpp -- server authentication via PKI (Phase 3)
  *
- * See certs.h for the allowed-tools rationale. No <openssl/ssl.h>, no DH/ECDH
- * exchange API anywhere in this file.
+ * See certs.h for what this is for. No SSL, no DH/ECDH exchange API here.
  */
 
 #include "certs.h"
@@ -22,9 +21,7 @@
 
 namespace certs {
 
-/* ------------------------------------------------------------------ */
-/* length-framed send/recv, matching the Phase 2 convention            */
-/* ------------------------------------------------------------------ */
+// length-framed send/recv, same convention as the rest of the project
 
 static bool send_framed(int fd, const unsigned char *buf, size_t len)
 {
@@ -50,9 +47,7 @@ static bool recv_framed(int fd, std::vector<unsigned char> &out, size_t cap)
     return net::read_exact(fd, out.data(), len);
 }
 
-/* ------------------------------------------------------------------ */
-/* loading helpers                                                     */
-/* ------------------------------------------------------------------ */
+// loading certs/keys from disk
 
 X509 *load_cert_file(const char *path, std::string *why)
 {
@@ -122,15 +117,12 @@ X509_STORE *load_ca_store(const char *ca_path, std::string *why)
     return store;
 }
 
-/* ------------------------------------------------------------------ */
-/* certificate validation                                              */
-/* ------------------------------------------------------------------ */
+// certificate validation
 
 /*
- * Validate cert against the trust store: this checks the signature chains to
- * the trusted CA AND that the current time is within the validity period
- * (X509_verify_cert enforces notBefore/notAfter). Then separately confirm the
- * expected server IP appears as an IP SAN.
+ * Checks the signature chains to the trusted CA and that we're within the
+ * validity period (X509_verify_cert enforces notBefore/notAfter), then
+ * separately checks the expected server IP is present as an IP SAN.
  */
 static bool validate_cert(X509 *cert, X509_STORE *store,
                           const char *expected_ip, std::string *why)
@@ -148,9 +140,8 @@ static bool validate_cert(X509 *cert, X509_STORE *store,
         goto done;
     }
 
-    /* (a) signature chains to the trusted CA, and
-       (b) the certificate is within its validity period.
-       Both are enforced here; a failure code distinguishes which. */
+    /* covers both the CA chain and the validity period; the error code
+       tells us which one failed */
     if (X509_verify_cert(ctx) != 1) {
         int err = X509_STORE_CTX_get_error(ctx);
         if (why) {
@@ -160,10 +151,9 @@ static bool validate_cert(X509 *cert, X509_STORE *store,
         goto done;
     }
 
-    /* (c) expected identity: the server is reached by IP (assignment
-       §1.2.1), so the IP must be present as an IP SAN. X509_check_ip_asc
-       returns 1 on match. This is the check that stops a validly-signed but
-       wrong-identity certificate. */
+    /* the server is reached by IP, so the IP has to show up as an IP SAN.
+       X509_check_ip_asc returns 1 on a match -- this is what stops a
+       validly-signed cert for the wrong host. */
     if (X509_check_ip_asc(cert, expected_ip, 0) != 1) {
         if (why) {
             *why = std::string("certificate identity mismatch: ") +
@@ -179,11 +169,9 @@ done:
     return ok;
 }
 
-/* ------------------------------------------------------------------ */
-/* signing / verifying the challenge                                   */
-/* ------------------------------------------------------------------ */
+// signing / verifying the challenge
 
-/* Sign msg with key using EVP_DigestSign (SHA-256). Allocates *sig_out. */
+// signs msg with key using EVP_DigestSign (SHA-256), fills sig_out
 static bool sign_message(EVP_PKEY *key,
                          const unsigned char *msg, size_t msglen,
                          std::vector<unsigned char> &sig_out,
@@ -203,7 +191,7 @@ static bool sign_message(EVP_PKEY *key,
         goto done;
     }
 
-    /* first call: query the signature length */
+    // first call just asks for the length
     if (EVP_DigestSign(md, nullptr, &siglen, msg, msglen) != 1) {
         if (why) *why = "EVP_DigestSign (size query) failed";
         goto done;
@@ -227,7 +215,7 @@ done:
     return ok;
 }
 
-/* Verify sig over msg using the public key extracted from cert. */
+// verifies sig over msg with the public key pulled from cert
 static bool verify_message(X509 *cert,
                            const unsigned char *msg, size_t msglen,
                            const unsigned char *sig, size_t siglen,
@@ -253,7 +241,7 @@ static bool verify_message(X509 *cert,
         goto done;
     }
 
-    /* Returns 1 only for a valid signature. Anything else -> reject. */
+    // only a return of 1 means the signature is good
     if (EVP_DigestVerify(md, sig, siglen, msg, msglen) != 1) {
         if (why) *why = "proof-of-possession failed: signature did not verify";
         goto done;
@@ -267,13 +255,11 @@ done:
     return ok;
 }
 
-/* ------------------------------------------------------------------ */
-/* server side                                                         */
-/* ------------------------------------------------------------------ */
+// server side
 
 bool server_send_auth(int fd, X509 *cert, EVP_PKEY *key, std::string *why)
 {
-    /* 1. send our certificate as DER, length-framed */
+    // send our certificate as DER, length-framed
     unsigned char *der = nullptr;
     int derlen = i2d_X509(cert, &der);
     if (derlen <= 0 || der == nullptr) {
@@ -288,7 +274,7 @@ bool server_send_auth(int fd, X509 *cert, EVP_PKEY *key, std::string *why)
         return false;
     }
 
-    /* 2. read the client's fresh challenge */
+    // read the client's fresh challenge
     std::vector<unsigned char> challenge;
     if (!recv_framed(fd, challenge, CHALLENGE_BYTES + 16)) {
         if (why) *why = "failed to read client challenge";
@@ -299,7 +285,7 @@ bool server_send_auth(int fd, X509 *cert, EVP_PKEY *key, std::string *why)
         return false;
     }
 
-    /* 3. sign the challenge and 4. send the signature */
+    // sign the challenge and send the signature back
     std::vector<unsigned char> sig;
     if (!sign_message(key, challenge.data(), challenge.size(), sig, why))
         return false;
@@ -312,14 +298,12 @@ bool server_send_auth(int fd, X509 *cert, EVP_PKEY *key, std::string *why)
     return true;
 }
 
-/* ------------------------------------------------------------------ */
-/* client side                                                         */
-/* ------------------------------------------------------------------ */
+// client side
 
 bool client_verify_auth(int fd, X509_STORE *ca_store,
                         const char *expected_ip, std::string *why)
 {
-    /* 1. receive the server certificate (DER, length-framed, bounded) */
+    // receive the server certificate (DER, length-framed, bounded)
     std::vector<unsigned char> der;
     if (!recv_framed(fd, der, MAX_CERT_BYTES)) {
         if (why) *why = "failed to read server certificate";
@@ -333,14 +317,14 @@ bool client_verify_auth(int fd, X509_STORE *ca_store,
         return false;
     }
 
-    /* 2. validate: CA signature chain, validity period, expected IP SAN.
-       Any failure aborts here -- before we send the challenge, before DH. */
+    // validate: CA chain, validity period, expected IP SAN. Any failure
+    // stops us here, before we send a challenge or touch DH.
     if (!validate_cert(cert, ca_store, expected_ip, why)) {
         X509_free(cert);
         return false;
     }
 
-    /* 3. generate a fresh random challenge with the CSPRNG */
+    // fresh random challenge from the CSPRNG
     unsigned char challenge[CHALLENGE_BYTES];
     if (RAND_bytes(challenge, sizeof(challenge)) != 1) {
         if (why) *why = "RAND_bytes failed to generate challenge";
@@ -354,7 +338,7 @@ bool client_verify_auth(int fd, X509_STORE *ca_store,
         return false;
     }
 
-    /* 4. receive and verify the signature over our challenge */
+    // receive and verify the signature over our challenge
     std::vector<unsigned char> sig;
     if (!recv_framed(fd, sig, MAX_SIG_BYTES)) {
         if (why) *why = "failed to read signature";

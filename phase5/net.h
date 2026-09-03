@@ -1,10 +1,10 @@
 /*
- * net.h -- CS6008 Phase 2
+ * net.h
  *
- * Blocking socket helpers that deal with short reads and short writes.
- * TCP is a byte stream: a single send() may transmit fewer bytes than asked,
- * and a single recv() may return fewer bytes than asked. Every framed read or
- * write in this project goes through these two functions.
+ * Blocking socket helpers that handle short reads and short writes.
+ * TCP is a byte stream: send() can write fewer bytes than asked and recv()
+ * can read fewer bytes than asked. Every framed read/write in this project
+ * goes through these two functions instead of raw send/recv.
  */
 
 #ifndef NET_H
